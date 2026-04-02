@@ -1,0 +1,10 @@
+node_modules/
+dist/
+uploads/*
+output/*
+!uploads/.gitkeep
+!output/.gitkeep
+.DS_Store
+package-lock.json
+.env.local
+测试文件地址.md

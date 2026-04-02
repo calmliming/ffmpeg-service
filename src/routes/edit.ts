@@ -1,0 +1,68 @@
+import { Router, Request, Response } from 'express';
+import { upload } from '../middleware/upload';
+import { ffmpegService } from '../services/ffmpeg.service';
+import { taskService } from '../services/task.service';
+
+const router = Router();
+
+// 视频裁剪
+router.post('/trim', upload.single('file'), async (req: Request, res: Response) => {
+  try {
+    if (!req.file) {
+      res.status(400).json({ success: false, error: '请上传视频文件' });
+      return;
+    }
+    if (!req.body.startTime) {
+      res.status(400).json({ success: false, error: '请提供 startTime 参数' });
+      return;
+    }
+
+    const task = taskService.create('trim');
+    res.json({ success: true, data: { taskId: task.id, status: task.status } });
+
+    ffmpegService.trim(req.file.path, task.id, {
+      startTime: req.body.startTime,
+      endTime: req.body.endTime,
+      duration: req.body.duration ? Number(req.body.duration) : undefined,
+    }).catch(() => {});
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 视频拼接
+router.post('/merge', upload.array('files', 10), async (req: Request, res: Response) => {
+  try {
+    const files = req.files as Express.Multer.File[];
+    if (!files || files.length < 2) {
+      res.status(400).json({ success: false, error: '请至少上传2个视频文件' });
+      return;
+    }
+
+    const task = taskService.create('merge');
+    res.json({ success: true, data: { taskId: task.id, status: task.status } });
+
+    ffmpegService.merge(files.map(f => f.path), task.id).catch(() => {});
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 提取音频
+router.post('/extract-audio', upload.single('file'), async (req: Request, res: Response) => {
+  try {
+    if (!req.file) {
+      res.status(400).json({ success: false, error: '请上传视频文件' });
+      return;
+    }
+
+    const task = taskService.create('extract-audio');
+    res.json({ success: true, data: { taskId: task.id, status: task.status } });
+
+    ffmpegService.extractAudio(req.file.path, task.id, req.body.format || 'mp3').catch(() => {});
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+export default router;
