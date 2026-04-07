@@ -6,5 +6,5 @@ output/*
 !output/.gitkeep
 .DS_Store
 package-lock.json
-.env.local
+# .env.local
 测试文件地址.md

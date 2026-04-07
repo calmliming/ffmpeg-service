@@ -5,4 +5,7 @@ export const config = {
   uploadDir: path.resolve(__dirname, '../uploads'),
   outputDir: path.resolve(__dirname, '../output'),
   maxFileSize: 500 * 1024 * 1024, // 500MB
+  ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',
+  ffprobePath: process.env.FFPROBE_PATH || 'ffprobe',
+  saveOutputFile: process.env.SAVE_OUTPUT_FILE !== 'false',
 };

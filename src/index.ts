@@ -1,5 +1,9 @@
+import dotenv from 'dotenv';
+dotenv.config({ path: '.env.local' });
+
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
 import { config } from './config';
 import { errorHandler } from './middleware/error';
 import { taskService } from './services/task.service';
@@ -16,7 +20,13 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // 静态文件服务 - 输出文件下载
-app.use('/api/files', express.static(config.outputDir));
+app.use('/api/files', express.static(config.outputDir), (req, res, _next) => {
+  // saveOutputFile 为 false 时，文件下载完成后自动删除
+  if (!config.saveOutputFile) {
+    const filePath = path.join(config.outputDir, req.path);
+    fs.unlink(filePath, () => {});
+  }
+});
 
 // 路由
 app.use('/api/health', healthRouter);
@@ -71,7 +81,8 @@ app.get('/api/tasks/:id/progress', (req, res) => {
 app.use(errorHandler);
 
 app.listen(config.port, () => {
-  console.log(`FFmpeg Service 已启动: http://localhost:${config.port}`);
+  const { version } = require('../package.json');
+  console.log(`FFmpeg Service v${version} 已启动: http://localhost:${config.port}`);
   console.log(`API 文档:`);
   console.log(`  GET  /api/health              - 健康检查`);
   console.log(`  POST /api/info                - 获取媒体信息`);

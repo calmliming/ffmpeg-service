@@ -6,6 +6,9 @@ import { taskService } from './task.service';
 import { execFile } from 'child_process';
 import type { TranscodeOptions, TrimOptions, WatermarkOptions, ScreenshotOptions, ThumbnailOptions, GifOptions, ComposeOptions } from '../types';
 
+ffmpeg.setFfmpegPath(config.ffmpegPath);
+ffmpeg.setFfprobePath(config.ffprobePath);
+
 function outputPath(ext: string): string {
   return path.join(config.outputDir, `${uuidv4()}.${ext}`);
 }
@@ -211,8 +214,15 @@ export const ffmpegService = {
       // 构建 ffmpeg 命令参数
       const args: string[] = [];
 
-      // 添加所有视频输入
+      // 添加所有视频输入（对 HTTP 源增加重连和完整读取参数）
       for (const url of videos) {
+        if (url.startsWith('http://') || url.startsWith('https://')) {
+          args.push(
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '5',
+          );
+        }
         args.push('-i', url);
       }
 
@@ -221,9 +231,9 @@ export const ffmpegService = {
       let filterParts: string[] = [];
       let concatInputs = '';
 
-      // 统一视频分辨率并拼接
+      // 统一视频分辨率并拼接，setpts 重置每段时间戳防止丢帧
       for (let i = 0; i < n; i++) {
-        filterParts.push(`[${i}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}]`);
+        filterParts.push(`[${i}:v]scale=iw:ih,setsar=1,setpts=PTS-STARTPTS[v${i}]`);
         concatInputs += `[v${i}]`;
       }
       filterParts.push(`${concatInputs}concat=n=${n}:v=1:a=0[outv]`);
@@ -237,7 +247,7 @@ export const ffmpegService = {
         // 同时拼接原始视频音频
         let audioConcat = '';
         for (let i = 0; i < n; i++) {
-          filterParts.push(`[${i}:a]aresample=44100[a${i}]`);
+          filterParts.push(`[${i}:a]aresample=44100,asetpts=PTS-STARTPTS[a${i}]`);
           audioConcat += `[a${i}]`;
         }
         filterParts.push(`${audioConcat}concat=n=${n}:v=0:a=1[origa]`);
@@ -250,7 +260,8 @@ export const ffmpegService = {
         // 无背景音乐：拼接视频和音频
         let audioConcat = '';
         for (let i = 0; i < n; i++) {
-          audioConcat += `[${i}:a]`;
+          filterParts.push(`[${i}:a]aresample=44100,asetpts=PTS-STARTPTS[a${i}]`);
+          audioConcat += `[a${i}]`;
         }
         filterParts.push(`${audioConcat}concat=n=${n}:v=0:a=1[outa]`);
 
@@ -262,7 +273,7 @@ export const ffmpegService = {
 
       console.log(`[FFmpeg Compose] ffmpeg ${args.join(' ')}`);
 
-      const proc = execFile('ffmpeg', args, { maxBuffer: 50 * 1024 * 1024 }, (err, _stdout, stderr) => {
+      const proc = execFile(config.ffmpegPath, args, { maxBuffer: 50 * 1024 * 1024 }, (err, _stdout, stderr) => {
         if (err) {
           console.error(`[FFmpeg Compose Error] ${stderr}`);
           taskService.update(taskId, { status: 'failed', error: err.message });
