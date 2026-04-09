@@ -9,6 +9,7 @@ export interface Task {
   completedAt?: Date;
   output?: string;
   error?: string;
+  inputFiles?: string[]; // 上传的临时文件路径，任务结束后清理
 }
 
 export interface ApiResponse<T = unknown> {

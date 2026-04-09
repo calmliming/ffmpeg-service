@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 dotenv.config({ path: '.env.local' });
 
 import express from 'express';
+import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
 import { config } from './config';
@@ -16,17 +17,33 @@ import composeRouter from './routes/compose';
 
 const app = express();
 
+app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// 静态文件服务 - 输出文件下载
-app.use('/api/files', express.static(config.outputDir), (req, res, _next) => {
-  // saveOutputFile 为 false 时，文件下载完成后自动删除
-  if (!config.saveOutputFile) {
-    const filePath = path.join(config.outputDir, req.path);
-    fs.unlink(filePath, () => {});
-  }
+// 请求日志
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const ms = Date.now() - start;
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms`);
+  });
+  next();
 });
+
+// 静态文件服务 - 输出文件下载
+app.use('/api/files', (req, res, next) => {
+  if (!config.saveOutputFile) {
+    // 确保文件完全发送后再删除
+    res.on('finish', () => {
+      if (res.statusCode === 200) {
+        const filePath = path.join(config.outputDir, req.path);
+        fs.unlink(filePath, () => {});
+      }
+    });
+  }
+  next();
+}, express.static(config.outputDir));
 
 // 路由
 app.use('/api/health', healthRouter);
@@ -67,6 +84,13 @@ app.get('/api/tasks/:id/progress', (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
+  // 如果任务已经是终态，直接发送最终状态并关闭
+  if (task.status === 'completed' || task.status === 'failed') {
+    res.write(`data: ${JSON.stringify(task)}\n\n`);
+    res.end();
+    return;
+  }
+
   const cleanup = taskService.onProgress(req.params.id, (updated) => {
     res.write(`data: ${JSON.stringify(updated)}\n\n`);
     if (updated.status === 'completed' || updated.status === 'failed') {
@@ -80,7 +104,7 @@ app.get('/api/tasks/:id/progress', (req, res) => {
 // 错误处理
 app.use(errorHandler);
 
-app.listen(config.port, () => {
+const server = app.listen(config.port, () => {
   const { version } = require('../package.json');
   console.log(`FFmpeg Service v${version} 已启动: http://localhost:${config.port}`);
   console.log(`API 文档:`);
@@ -98,3 +122,20 @@ app.listen(config.port, () => {
   console.log(`  GET  /api/tasks/:id           - 查询任务状态`);
   console.log(`  GET  /api/tasks/:id/progress  - SSE实时进度`);
 });
+
+// 优雅关闭
+function shutdown(signal: string) {
+  console.log(`\n收到 ${signal} 信号，正在关闭服务...`);
+  server.close(() => {
+    console.log('HTTP 服务已关闭');
+    process.exit(0);
+  });
+  // 超时强制退出
+  setTimeout(() => {
+    console.error('关闭超时，强制退出');
+    process.exit(1);
+  }, 30000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

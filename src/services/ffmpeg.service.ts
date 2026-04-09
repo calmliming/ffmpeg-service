@@ -9,11 +9,21 @@ import type { TranscodeOptions, TrimOptions, WatermarkOptions, ScreenshotOptions
 ffmpeg.setFfmpegPath(config.ffmpegPath);
 ffmpeg.setFfprobePath(config.ffprobePath);
 
+/** 转义 drawtext filter 中的特殊字符，防止命令注入 */
+function escapeDrawtext(text: string): string {
+  return text
+    .replace(/\\/g, '\\\\\\\\')
+    .replace(/'/g, "'\\\\\\''")
+    .replace(/:/g, '\\\\:')
+    .replace(/%/g, '%%');
+}
+
 function outputPath(ext: string): string {
   return path.join(config.outputDir, `${uuidv4()}.${ext}`);
 }
 
-function runWithProgress(command: ffmpeg.FfmpegCommand, taskId: string): Promise<string> {
+async function runWithProgress(command: ffmpeg.FfmpegCommand, taskId: string): Promise<string> {
+  await taskService.acquire();
   return new Promise((resolve, reject) => {
     let output = '';
     command
@@ -117,7 +127,7 @@ export const ffmpegService = {
         'center': 'x=(w-tw)/2:y=(h-th)/2',
       };
       const pos = posMap[options.position || 'bottom-right'];
-      cmd.videoFilters(`drawtext=text='${options.text}':fontsize=${fontSize}:fontcolor=${fontColor}:${pos}`);
+      cmd.videoFilters(`drawtext=text='${escapeDrawtext(options.text)}':fontsize=${fontSize}:fontcolor=${fontColor}:${pos}`);
     } else if (options.image) {
       const posMap: Record<string, string> = {
         'top-left': 'overlay=10:10',
@@ -208,7 +218,22 @@ export const ffmpegService = {
     const out = outputPath('mp4');
     const { videos, music, musicVolume = 1 } = options;
 
+    await taskService.acquire();
     taskService.update(taskId, { status: 'processing', progress: 0 });
+
+    // 先 probe 每个视频获取真实时长和音频轨信息
+    let totalDuration = 0;
+    const hasAudio: boolean[] = [];
+    for (const url of videos) {
+      try {
+        const info = await this.getInfo(url);
+        totalDuration += info.format.duration || 8;
+        hasAudio.push(info.streams.some(s => s.codec_type === 'audio'));
+      } catch {
+        totalDuration += 8;
+        hasAudio.push(true); // probe 失败时假设有音频
+      }
+    }
 
     return new Promise((resolve, reject) => {
       // 构建 ffmpeg 命令参数
@@ -244,10 +269,14 @@ export const ffmpegService = {
         const musicIdx = n;
         filterParts.push(`[${musicIdx}:a]volume=${musicVolume}[bgm]`);
 
-        // 同时拼接原始视频音频
+        // 同时拼接原始视频音频（无音频轨的视频使用静音替代）
         let audioConcat = '';
         for (let i = 0; i < n; i++) {
-          filterParts.push(`[${i}:a]aresample=44100,asetpts=PTS-STARTPTS[a${i}]`);
+          if (hasAudio[i]) {
+            filterParts.push(`[${i}:a]aresample=44100,asetpts=PTS-STARTPTS[a${i}]`);
+          } else {
+            filterParts.push(`anullsrc=r=44100:cl=stereo[a${i}]`);
+          }
           audioConcat += `[a${i}]`;
         }
         filterParts.push(`${audioConcat}concat=n=${n}:v=0:a=1[origa]`);
@@ -257,10 +286,14 @@ export const ffmpegService = {
         args.push('-filter_complex', filterParts.join(';'));
         args.push('-map', '[outv]', '-map', '[outa]');
       } else {
-        // 无背景音乐：拼接视频和音频
+        // 无背景音乐：拼接视频和音频（无音频轨的视频使用静音替代）
         let audioConcat = '';
         for (let i = 0; i < n; i++) {
-          filterParts.push(`[${i}:a]aresample=44100,asetpts=PTS-STARTPTS[a${i}]`);
+          if (hasAudio[i]) {
+            filterParts.push(`[${i}:a]aresample=44100,asetpts=PTS-STARTPTS[a${i}]`);
+          } else {
+            filterParts.push(`anullsrc=r=44100:cl=stereo[a${i}]`);
+          }
           audioConcat += `[a${i}]`;
         }
         filterParts.push(`${audioConcat}concat=n=${n}:v=0:a=1[outa]`);
@@ -290,9 +323,7 @@ export const ffmpegService = {
         const match = str.match(/time=(\d+):(\d+):(\d+\.\d+)/);
         if (match) {
           const seconds = parseInt(match[1]) * 3600 + parseInt(match[2]) * 60 + parseFloat(match[3]);
-          // 粗略进度（假设总时长 = 视频数 * 8 秒）
-          const estimated = videos.length * 8;
-          const progress = Math.min(99, Math.round((seconds / estimated) * 100));
+          const progress = Math.min(99, Math.round((seconds / totalDuration) * 100));
           taskService.update(taskId, { progress });
         }
       });

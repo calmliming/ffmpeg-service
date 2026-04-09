@@ -5,6 +5,7 @@
 FFmpeg Service 是一个基于 Node.js/TypeScript 的 RESTful API 服务，将 FFmpeg 的常用功能封装为 HTTP 接口，支持视频转码、剪辑、处理、在线合成等功能。
 
 - **基础地址**: `http://localhost:9527`
+- **线上测试地址**: `http://124.221.157.202:9527`
 - **最大上传文件**: 500MB
 - **支持格式**: video/\*、audio/\*、image/\*
 

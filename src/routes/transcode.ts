@@ -23,6 +23,7 @@ router.post('/', upload.single('file'), async (req: Request, res: Response) => {
     };
 
     const task = taskService.create('transcode');
+    task.inputFiles = [req.file.path];
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
 
     ffmpegService.transcode(req.file.path, task.id, options).catch(() => {});

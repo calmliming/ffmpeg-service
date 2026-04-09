@@ -20,6 +20,7 @@ router.post('/watermark', upload.fields([
 
     const watermarkImage = files?.image?.[0];
     const task = taskService.create('watermark');
+    task.inputFiles = [videoFile.path, ...(watermarkImage ? [watermarkImage.path] : [])];
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
 
     ffmpegService.watermark(videoFile.path, task.id, {
@@ -48,6 +49,7 @@ router.post('/screenshot', upload.single('file'), async (req: Request, res: Resp
     }
 
     const task = taskService.create('screenshot');
+    task.inputFiles = [req.file.path];
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
 
     const timeList = typeof timestamps === 'string' ? timestamps.split(',') : timestamps;
@@ -66,6 +68,7 @@ router.post('/thumbnail', upload.single('file'), async (req: Request, res: Respo
     }
 
     const task = taskService.create('thumbnail');
+    task.inputFiles = [req.file.path];
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
 
     ffmpegService.thumbnail(req.file.path, task.id, {
@@ -86,6 +89,7 @@ router.post('/gif', upload.single('file'), async (req: Request, res: Response) =
     }
 
     const task = taskService.create('gif');
+    task.inputFiles = [req.file.path];
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
 
     ffmpegService.toGif(req.file.path, task.id, {

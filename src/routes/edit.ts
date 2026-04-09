@@ -18,6 +18,7 @@ router.post('/trim', upload.single('file'), async (req: Request, res: Response) 
     }
 
     const task = taskService.create('trim');
+    task.inputFiles = [req.file.path];
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
 
     ffmpegService.trim(req.file.path, task.id, {
@@ -40,6 +41,7 @@ router.post('/merge', upload.array('files', 10), async (req: Request, res: Respo
     }
 
     const task = taskService.create('merge');
+    task.inputFiles = files.map(f => f.path);
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
 
     ffmpegService.merge(files.map(f => f.path), task.id).catch(() => {});
@@ -57,6 +59,7 @@ router.post('/extract-audio', upload.single('file'), async (req: Request, res: R
     }
 
     const task = taskService.create('extract-audio');
+    task.inputFiles = [req.file.path];
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
 
     ffmpegService.extractAudio(req.file.path, task.id, req.body.format || 'mp3').catch(() => {});
