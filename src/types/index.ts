@@ -62,4 +62,5 @@ export interface ComposeOptions {
   videos: string[];   // 视频 URL 列表
   music?: string;     // 背景音乐 URL（可选）
   musicVolume?: number; // 音乐音量 0-1，默认 1
+  muteOriginalAudio?: boolean; // 是否消除视频原声，默认 false
 }

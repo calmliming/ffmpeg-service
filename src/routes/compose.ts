@@ -10,6 +10,7 @@ const composeSchema = z.object({
   videos: z.array(z.string().url('请提供有效的视频 URL')).min(1, '请至少提供1个视频 URL'),
   music: z.string().url('请提供有效的音乐 URL').optional(),
   musicVolume: z.number().min(0).max(1).optional(),
+  muteOriginalAudio: z.boolean().optional(),
 });
 
 /**
@@ -18,7 +19,7 @@ const composeSchema = z.object({
  */
 router.post('/', validate(composeSchema), async (req: Request, res: Response) => {
   try {
-    const { videos, music, musicVolume } = req.body;
+    const { videos, music, musicVolume, muteOriginalAudio } = req.body;
 
     const task = taskService.create('compose');
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
@@ -27,6 +28,7 @@ router.post('/', validate(composeSchema), async (req: Request, res: Response) =>
       videos,
       music,
       musicVolume,
+      muteOriginalAudio,
     }).catch(() => {});
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });

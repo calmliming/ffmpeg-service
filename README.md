@@ -370,6 +370,7 @@ curl -X POST http://localhost:9527/api/process/gif \
 | videos | string[] | 是 | 视频 URL 列表 |
 | music | string | 否 | 背景音乐 URL |
 | musicVolume | number | 否 | 音乐音量，范围 `0-1`，默认 `1` |
+| muteOriginalAudio | boolean | 否 | 是否消除视频原声，默认 `false` |
 
 **请求示例：**
 
@@ -401,7 +402,8 @@ curl -X POST http://localhost:9527/api/compose \
 
 **说明：**
 - 视频会自动统一缩放至 1280x720 分辨率
-- 原始视频音频与背景音乐自动混合
+- 默认原始视频音频与背景音乐自动混合
+- 设置 `muteOriginalAudio: true` 可消除视频原声，仅保留背景音乐
 - 输出时长以视频总时长为准（音乐不够会自动结束，音乐过长会截断）
 
 ---

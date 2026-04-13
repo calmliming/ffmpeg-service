@@ -216,7 +216,7 @@ export const ffmpegService = {
    */
   async compose(taskId: string, options: ComposeOptions): Promise<string> {
     const out = outputPath('mp4');
-    const { videos, music, musicVolume = 1 } = options;
+    const { videos, music, musicVolume = 1, muteOriginalAudio = false } = options;
 
     await taskService.acquire();
     taskService.update(taskId, { status: 'processing', progress: 0 });
@@ -228,10 +228,14 @@ export const ffmpegService = {
       try {
         const info = await this.getInfo(url);
         totalDuration += info.format.duration || 8;
-        hasAudio.push(info.streams.some(s => s.codec_type === 'audio'));
+        if (!muteOriginalAudio) {
+          hasAudio.push(info.streams.some(s => s.codec_type === 'audio'));
+        }
       } catch {
         totalDuration += 8;
-        hasAudio.push(true); // probe 失败时假设有音频
+        if (!muteOriginalAudio) {
+          hasAudio.push(true);
+        }
       }
     }
 
@@ -263,7 +267,23 @@ export const ffmpegService = {
       }
       filterParts.push(`${concatInputs}concat=n=${n}:v=1:a=0[outv]`);
 
-      if (music) {
+      if (muteOriginalAudio) {
+        // 消除视频原声
+        if (music) {
+          // 仅使用背景音乐作为音频
+          args.push('-i', music);
+          const musicIdx = n;
+          filterParts.push(`[${musicIdx}:a]volume=${musicVolume}[outa]`);
+          args.push('-filter_complex', filterParts.join(';'));
+          args.push('-map', '[outv]', '-map', '[outa]', '-shortest');
+          args.push('-c:v', 'libx264', '-c:a', 'aac', '-y', out);
+        } else {
+          // 无背景音乐：输出静音视频
+          args.push('-filter_complex', filterParts.join(';'));
+          args.push('-map', '[outv]', '-an');
+          args.push('-c:v', 'libx264', '-y', out);
+        }
+      } else if (music) {
         // 有背景音乐：添加音乐输入，混合后截断到视频长度
         args.push('-i', music);
         const musicIdx = n;
@@ -285,6 +305,7 @@ export const ffmpegService = {
 
         args.push('-filter_complex', filterParts.join(';'));
         args.push('-map', '[outv]', '-map', '[outa]');
+        args.push('-c:v', 'libx264', '-c:a', 'aac', '-y', out);
       } else {
         // 无背景音乐：拼接视频和音频（无音频轨的视频使用静音替代）
         let audioConcat = '';
@@ -300,9 +321,8 @@ export const ffmpegService = {
 
         args.push('-filter_complex', filterParts.join(';'));
         args.push('-map', '[outv]', '-map', '[outa]');
+        args.push('-c:v', 'libx264', '-c:a', 'aac', '-y', out);
       }
-
-      args.push('-c:v', 'libx264', '-c:a', 'aac', '-y', out);
 
       console.log(`[FFmpeg Compose] ffmpeg ${args.join(' ')}`);
 
