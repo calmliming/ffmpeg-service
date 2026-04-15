@@ -1,5 +1,6 @@
 import dotenv from 'dotenv';
-dotenv.config({ path: '.env.local' });
+dotenv.config({ path: '.env.local' }); // 本地开发
+dotenv.config(); // 生产环境读 .env
 
 import express from 'express';
 import cors from 'cors';
