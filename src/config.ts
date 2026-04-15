@@ -10,4 +10,5 @@ export const config = {
   ffprobePath: process.env.FFPROBE_PATH || 'ffprobe',
   saveOutputFile: process.env.SAVE_OUTPUT_FILE !== 'false',
   maxConcurrentTasks: Number(process.env.MAX_CONCURRENT_TASKS) || Math.max(1, os.cpus().length - 1),
+  redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
 };

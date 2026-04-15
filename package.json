@@ -10,10 +10,12 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "bullmq": "^5.74.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.0",
     "express": "^4.21.0",
     "fluent-ffmpeg": "^2.1.3",
+    "ioredis": "^5.10.1",
     "multer": "^1.4.5-lts.1",
     "uuid": "^10.0.0",
     "zod": "^3.23.0"

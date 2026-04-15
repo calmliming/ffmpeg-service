@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { upload } from '../middleware/upload';
-import { ffmpegService } from '../services/ffmpeg.service';
+import { jobQueue } from '../services/queue.service';
 import { taskService } from '../services/task.service';
 
 const router = Router();
@@ -19,13 +19,12 @@ router.post('/trim', upload.single('file'), async (req: Request, res: Response) 
 
     const task = taskService.create('trim');
     task.inputFiles = [req.file.path];
-    res.json({ success: true, data: { taskId: task.id, status: task.status } });
-
-    ffmpegService.trim(req.file.path, task.id, {
+    await jobQueue.add('trim', { taskId: task.id, type: 'trim', inputPath: req.file.path, options: {
       startTime: req.body.startTime,
       endTime: req.body.endTime,
       duration: req.body.duration ? Number(req.body.duration) : undefined,
-    }).catch(() => {});
+    }});
+    res.json({ success: true, data: { taskId: task.id, status: task.status } });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -42,9 +41,8 @@ router.post('/merge', upload.array('files', 10), async (req: Request, res: Respo
 
     const task = taskService.create('merge');
     task.inputFiles = files.map(f => f.path);
+    await jobQueue.add('merge', { taskId: task.id, type: 'merge', inputPaths: files.map(f => f.path) });
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
-
-    ffmpegService.merge(files.map(f => f.path), task.id).catch(() => {});
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -60,9 +58,8 @@ router.post('/extract-audio', upload.single('file'), async (req: Request, res: R
 
     const task = taskService.create('extract-audio');
     task.inputFiles = [req.file.path];
+    await jobQueue.add('extract-audio', { taskId: task.id, type: 'extract-audio', inputPath: req.file.path, format: req.body.format || 'mp3' });
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
-
-    ffmpegService.extractAudio(req.file.path, task.id, req.body.format || 'mp3').catch(() => {});
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }

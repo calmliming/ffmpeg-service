@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { upload } from '../middleware/upload';
-import { ffmpegService } from '../services/ffmpeg.service';
+import { jobQueue } from '../services/queue.service';
 import { taskService } from '../services/task.service';
 
 const router = Router();
@@ -21,15 +21,14 @@ router.post('/watermark', upload.fields([
     const watermarkImage = files?.image?.[0];
     const task = taskService.create('watermark');
     task.inputFiles = [videoFile.path, ...(watermarkImage ? [watermarkImage.path] : [])];
-    res.json({ success: true, data: { taskId: task.id, status: task.status } });
-
-    ffmpegService.watermark(videoFile.path, task.id, {
+    await jobQueue.add('watermark', { taskId: task.id, type: 'watermark', inputPath: videoFile.path, options: {
       text: req.body.text,
       image: watermarkImage?.path,
       position: req.body.position || 'bottom-right',
       fontSize: req.body.fontSize ? Number(req.body.fontSize) : undefined,
       fontColor: req.body.fontColor,
-    }).catch(() => {});
+    }});
+    res.json({ success: true, data: { taskId: task.id, status: task.status } });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -50,10 +49,9 @@ router.post('/screenshot', upload.single('file'), async (req: Request, res: Resp
 
     const task = taskService.create('screenshot');
     task.inputFiles = [req.file.path];
-    res.json({ success: true, data: { taskId: task.id, status: task.status } });
-
     const timeList = typeof timestamps === 'string' ? timestamps.split(',') : timestamps;
-    ffmpegService.screenshot(req.file.path, task.id, { timestamps: timeList }).catch(() => {});
+    await jobQueue.add('screenshot', { taskId: task.id, type: 'screenshot', inputPath: req.file.path, options: { timestamps: timeList } });
+    res.json({ success: true, data: { taskId: task.id, status: task.status } });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -69,12 +67,11 @@ router.post('/thumbnail', upload.single('file'), async (req: Request, res: Respo
 
     const task = taskService.create('thumbnail');
     task.inputFiles = [req.file.path];
-    res.json({ success: true, data: { taskId: task.id, status: task.status } });
-
-    ffmpegService.thumbnail(req.file.path, task.id, {
+    await jobQueue.add('thumbnail', { taskId: task.id, type: 'thumbnail', inputPath: req.file.path, options: {
       count: req.body.count ? Number(req.body.count) : undefined,
       size: req.body.size,
-    }).catch(() => {});
+    }});
+    res.json({ success: true, data: { taskId: task.id, status: task.status } });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -90,14 +87,13 @@ router.post('/gif', upload.single('file'), async (req: Request, res: Response) =
 
     const task = taskService.create('gif');
     task.inputFiles = [req.file.path];
-    res.json({ success: true, data: { taskId: task.id, status: task.status } });
-
-    ffmpegService.toGif(req.file.path, task.id, {
+    await jobQueue.add('gif', { taskId: task.id, type: 'gif', inputPath: req.file.path, options: {
       startTime: req.body.startTime,
       duration: req.body.duration ? Number(req.body.duration) : undefined,
       width: req.body.width ? Number(req.body.width) : undefined,
       fps: req.body.fps ? Number(req.body.fps) : undefined,
-    }).catch(() => {});
+    }});
+    res.json({ success: true, data: { taskId: task.id, status: task.status } });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }

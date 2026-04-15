@@ -8,6 +8,7 @@ import fs from 'fs';
 import { config } from './config';
 import { errorHandler } from './middleware/error';
 import { taskService } from './services/task.service';
+import './services/queue.service'; // 启动 BullMQ Worker
 import healthRouter from './routes/health';
 import infoRouter from './routes/info';
 import transcodeRouter from './routes/transcode';

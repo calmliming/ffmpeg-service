@@ -1,0 +1,30 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: always
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  ffmpeg-service:
+    build: .
+    ports:
+      - "9527:9527"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - MAX_CONCURRENT_TASKS=3
+      - SAVE_OUTPUT_FILE=true
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+    volumes:
+      - output_data:/app/output
+
+volumes:
+  redis_data:
+  output_data:

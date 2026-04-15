@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { validate } from '../middleware/validate';
-import { ffmpegService } from '../services/ffmpeg.service';
+import { jobQueue } from '../services/queue.service';
 import { taskService } from '../services/task.service';
 
 const router = Router();
@@ -22,14 +22,8 @@ router.post('/', validate(composeSchema), async (req: Request, res: Response) =>
     const { videos, music, musicVolume, muteOriginalAudio } = req.body;
 
     const task = taskService.create('compose');
+    await jobQueue.add('compose', { taskId: task.id, type: 'compose', options: { videos, music, musicVolume, muteOriginalAudio } });
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
-
-    ffmpegService.compose(task.id, {
-      videos,
-      music,
-      musicVolume,
-      muteOriginalAudio,
-    }).catch(() => {});
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }

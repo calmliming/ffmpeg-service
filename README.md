@@ -532,3 +532,4 @@ curl -O http://localhost:9527/api/files/output-abc-123.mp4
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `PORT` | 服务端口 | `9527` |
+| `MAX_CONCURRENT_TASKS` | 最大并发任务数，2G2核建议设为 `3` | `CPU核数-1` |

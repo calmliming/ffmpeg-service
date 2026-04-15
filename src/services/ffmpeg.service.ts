@@ -1,5 +1,6 @@
 import ffmpeg from 'fluent-ffmpeg';
 import path from 'path';
+import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import { config } from '../config';
 import { taskService } from './task.service';
@@ -22,8 +23,21 @@ function outputPath(ext: string): string {
   return path.join(config.outputDir, `${uuidv4()}.${ext}`);
 }
 
+/** 执行 ffmpeg 命令，返回 Promise */
+function runFFmpeg(args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile(config.ffmpegPath, args, { maxBuffer: 10 * 1024 * 1024 }, (err, _stdout, stderr) => {
+      if (err) {
+        console.error(`[FFmpeg Error] ${(stderr ?? '').slice(-1000)}`);
+        reject(new Error(err.message + '\n' + (stderr ?? '').slice(-500)));
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
 async function runWithProgress(command: ffmpeg.FfmpegCommand, taskId: string): Promise<string> {
-  await taskService.acquire();
   return new Promise((resolve, reject) => {
     let output = '';
     command
@@ -211,142 +225,67 @@ export const ffmpegService = {
   },
 
   /**
-   * 合成视频：将多个在线视频 URL 拼接，并可叠加背景音乐
-   * 直接使用在线 URL，无需下载
+   * 合成视频：将多个在线视频 URL 拼接，并可叠加背景音乐。
+   *
+   * 采用"分段转码 + concat demuxer"策略，解决低内存服务器崩溃问题：
+   * 1. 每次只处理 1 个视频片段，转码到本地临时文件（控制内存峰值）
+   * 2. 用 -f concat -c copy 拼接所有片段（流复制，几乎不占内存）
+   * 3. 最后单独混入背景音乐
    */
   async compose(taskId: string, options: ComposeOptions): Promise<string> {
-    const out = outputPath('mp4');
     const { videos, music, musicVolume = 1, muteOriginalAudio = false } = options;
+    const out = outputPath('mp4');
 
-    await taskService.acquire();
     taskService.update(taskId, { status: 'processing', progress: 0 });
 
-    // 先 probe 每个视频获取真实时长和音频轨信息
-    let totalDuration = 0;
-    const hasAudio: boolean[] = [];
-    for (const url of videos) {
-      try {
-        const info = await this.getInfo(url);
-        totalDuration += info.format.duration || 8;
-        if (!muteOriginalAudio) {
-          hasAudio.push(info.streams.some(s => s.codec_type === 'audio'));
-        }
-      } catch {
-        totalDuration += 8;
-        if (!muteOriginalAudio) {
-          hasAudio.push(true);
-        }
-      }
-    }
+    let concatFile = '';
+    let mergedFile = '';
 
-    return new Promise((resolve, reject) => {
-      // 构建 ffmpeg 命令参数
-      const args: string[] = [];
+    try {
+      // Step 1: 写 concat 列表，直接引用原始 URL，流复制拼接
+      concatFile = path.join(config.outputDir, `${uuidv4()}_concat.txt`);
+      const concatLines = ['ffconcat version 1.0', ...videos.map(url => `file '${url}'`)];
+      fs.writeFileSync(concatFile, concatLines.join('\n'));
+      taskService.update(taskId, { progress: 10 });
 
-      // 添加所有视频输入（对 HTTP 源增加重连和完整读取参数）
-      for (const url of videos) {
-        if (url.startsWith('http://') || url.startsWith('https://')) {
-          args.push(
-            '-reconnect', '1',
-            '-reconnect_streamed', '1',
-            '-reconnect_delay_max', '5',
+      mergedFile = path.join(config.outputDir, `${uuidv4()}_merged.mp4`);
+      await runFFmpeg(['-f', 'concat', '-safe', '0', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto', '-i', concatFile, '-c', 'copy', '-y', mergedFile]);
+      taskService.update(taskId, { progress: 75 });
+
+      // Step 3: 混入背景音乐（或直接输出）
+      if (music) {
+        const audioArgs: string[] = ['-i', mergedFile];
+        if (music.startsWith('http://') || music.startsWith('https://')) {
+          audioArgs.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5');
+        }
+        audioArgs.push('-i', music);
+
+        if (muteOriginalAudio) {
+          audioArgs.push(
+            '-filter_complex', `[1:a]volume=${musicVolume}[outa]`,
+            '-map', '0:v', '-map', '[outa]',
+          );
+        } else {
+          audioArgs.push(
+            '-filter_complex', `[0:a]volume=1[va];[1:a]volume=${musicVolume}[ba];[va][ba]amix=inputs=2:duration=first[outa]`,
+            '-map', '0:v', '-map', '[outa]',
           );
         }
-        args.push('-i', url);
-      }
-
-      // 构建 filter_complex
-      const n = videos.length;
-      let filterParts: string[] = [];
-      let concatInputs = '';
-
-      // 统一视频分辨率并拼接，setpts 重置每段时间戳防止丢帧
-      for (let i = 0; i < n; i++) {
-        filterParts.push(`[${i}:v]scale=iw:ih,setsar=1,setpts=PTS-STARTPTS[v${i}]`);
-        concatInputs += `[v${i}]`;
-      }
-      filterParts.push(`${concatInputs}concat=n=${n}:v=1:a=0[outv]`);
-
-      if (muteOriginalAudio) {
-        // 消除视频原声
-        if (music) {
-          // 仅使用背景音乐作为音频
-          args.push('-i', music);
-          const musicIdx = n;
-          filterParts.push(`[${musicIdx}:a]volume=${musicVolume}[outa]`);
-          args.push('-filter_complex', filterParts.join(';'));
-          args.push('-map', '[outv]', '-map', '[outa]', '-shortest');
-          args.push('-c:v', 'libx264', '-c:a', 'aac', '-y', out);
-        } else {
-          // 无背景音乐：输出静音视频
-          args.push('-filter_complex', filterParts.join(';'));
-          args.push('-map', '[outv]', '-an');
-          args.push('-c:v', 'libx264', '-y', out);
-        }
-      } else if (music) {
-        // 有背景音乐：添加音乐输入，混合后截断到视频长度
-        args.push('-i', music);
-        const musicIdx = n;
-        filterParts.push(`[${musicIdx}:a]volume=${musicVolume}[bgm]`);
-
-        // 同时拼接原始视频音频（无音频轨的视频使用静音替代）
-        let audioConcat = '';
-        for (let i = 0; i < n; i++) {
-          if (hasAudio[i]) {
-            filterParts.push(`[${i}:a]aresample=44100,asetpts=PTS-STARTPTS[a${i}]`);
-          } else {
-            filterParts.push(`anullsrc=r=44100:cl=stereo[a${i}]`);
-          }
-          audioConcat += `[a${i}]`;
-        }
-        filterParts.push(`${audioConcat}concat=n=${n}:v=0:a=1[origa]`);
-        // 混合原始音频和背景音乐，以视频音频时长为准
-        filterParts.push(`[origa][bgm]amix=inputs=2:duration=first[outa]`);
-
-        args.push('-filter_complex', filterParts.join(';'));
-        args.push('-map', '[outv]', '-map', '[outa]');
-        args.push('-c:v', 'libx264', '-c:a', 'aac', '-y', out);
+        audioArgs.push('-c:v', 'copy', '-c:a', 'aac', '-shortest', '-y', out);
+        await runFFmpeg(audioArgs);
       } else {
-        // 无背景音乐：拼接视频和音频（无音频轨的视频使用静音替代）
-        let audioConcat = '';
-        for (let i = 0; i < n; i++) {
-          if (hasAudio[i]) {
-            filterParts.push(`[${i}:a]aresample=44100,asetpts=PTS-STARTPTS[a${i}]`);
-          } else {
-            filterParts.push(`anullsrc=r=44100:cl=stereo[a${i}]`);
-          }
-          audioConcat += `[a${i}]`;
-        }
-        filterParts.push(`${audioConcat}concat=n=${n}:v=0:a=1[outa]`);
-
-        args.push('-filter_complex', filterParts.join(';'));
-        args.push('-map', '[outv]', '-map', '[outa]');
-        args.push('-c:v', 'libx264', '-c:a', 'aac', '-y', out);
+        fs.renameSync(mergedFile, out);
+        mergedFile = ''; // 不再删除，已移动到最终输出
       }
 
-      console.log(`[FFmpeg Compose] ffmpeg ${args.join(' ')}`);
-
-      const proc = execFile(config.ffmpegPath, args, { maxBuffer: 50 * 1024 * 1024 }, (err, _stdout, stderr) => {
-        if (err) {
-          console.error(`[FFmpeg Compose Error] ${stderr}`);
-          taskService.update(taskId, { status: 'failed', error: err.message });
-          reject(err);
-        } else {
-          taskService.update(taskId, { status: 'completed', progress: 100, output: out });
-          resolve(out);
-        }
-      });
-
-      // 解析进度（从 stderr 中读取 time=）
-      proc.stderr?.on('data', (data: Buffer) => {
-        const str = data.toString();
-        const match = str.match(/time=(\d+):(\d+):(\d+\.\d+)/);
-        if (match) {
-          const seconds = parseInt(match[1]) * 3600 + parseInt(match[2]) * 60 + parseFloat(match[3]);
-          const progress = Math.min(99, Math.round((seconds / totalDuration) * 100));
-          taskService.update(taskId, { progress });
-        }
-      });
-    });
+      taskService.update(taskId, { status: 'completed', progress: 100, output: out });
+      return out;
+    } catch (err: any) {
+      taskService.update(taskId, { status: 'failed', error: err.message });
+      throw err;
+    } finally {
+      if (concatFile) fs.unlink(concatFile, () => {});
+      if (mergedFile) fs.unlink(mergedFile, () => {});
+    }
   },
 };

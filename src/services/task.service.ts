@@ -2,7 +2,6 @@ import { Task } from '../types';
 import { v4 as uuidv4 } from 'uuid';
 import { EventEmitter } from 'events';
 import fs from 'fs';
-import { config } from '../config';
 
 /** 已完成任务保留时长（毫秒），默认 1 小时 */
 const TASK_TTL = 60 * 60 * 1000;
@@ -12,8 +11,6 @@ const CLEANUP_INTERVAL = 10 * 60 * 1000;
 class TaskService {
   private tasks = new Map<string, Task>();
   private emitter = new EventEmitter();
-  private runningCount = 0;
-  private queue: Array<() => void> = [];
 
   constructor() {
     // 定时清理已完成/失败的过期任务
@@ -48,40 +45,13 @@ class TaskService {
           fs.unlink(f, () => {});
         }
       }
-      // 释放并发槽位，执行队列中的下一个任务
-      this.runningCount--;
-      this.dequeue();
     }
     this.emitter.emit(`task:${id}`, task);
-  }
-
-  /**
-   * 并发控制：获取执行槽位
-   * 如果当前并发数未满，立即执行；否则排队等待
-   */
-  acquire(): Promise<void> {
-    if (this.runningCount < config.maxConcurrentTasks) {
-      this.runningCount++;
-      return Promise.resolve();
-    }
-    return new Promise((resolve) => {
-      this.queue.push(() => {
-        this.runningCount++;
-        resolve();
-      });
-    });
   }
 
   onProgress(id: string, listener: (task: Task) => void) {
     this.emitter.on(`task:${id}`, listener);
     return () => this.emitter.removeListener(`task:${id}`, listener);
-  }
-
-  private dequeue() {
-    if (this.queue.length > 0 && this.runningCount < config.maxConcurrentTasks) {
-      const next = this.queue.shift()!;
-      next();
-    }
   }
 
   private cleanup() {
