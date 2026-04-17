@@ -4,7 +4,7 @@ import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import { config } from '../config';
 import { taskService } from './task.service';
-import { execFile } from 'child_process';
+import { spawn } from 'child_process';
 import type { TranscodeOptions, TrimOptions, WatermarkOptions, ScreenshotOptions, ThumbnailOptions, GifOptions, ComposeOptions } from '../types';
 
 ffmpeg.setFfmpegPath(config.ffmpegPath);
@@ -23,17 +23,58 @@ function outputPath(ext: string): string {
   return path.join(config.outputDir, `${uuidv4()}.${ext}`);
 }
 
-/** 执行 ffmpeg 命令，返回 Promise */
-function runFFmpeg(args: string[]): Promise<void> {
+function parseSeconds(timeStr: string): number {
+  const m = timeStr.match(/(\d+):(\d+):(\d+\.?\d*)/);
+  if (!m) return 0;
+  return parseInt(m[1]) * 3600 + parseInt(m[2]) * 60 + parseFloat(m[3]);
+}
+
+/** 执行 ffmpeg 命令，流式解析进度并映射到 [rangeStart, rangeEnd] */
+function runFFmpeg(args: string[], taskId?: string, progressRange: [number, number] = [0, 100], knownDuration?: number, segmentDuration?: number): Promise<void> {
   return new Promise((resolve, reject) => {
-    execFile(config.ffmpegPath, args, { maxBuffer: 10 * 1024 * 1024 }, (err, _stdout, stderr) => {
-      if (err) {
-        console.error(`[FFmpeg Error] ${(stderr ?? '').slice(-1000)}`);
-        reject(new Error(err.message + '\n' + (stderr ?? '').slice(-500)));
+    const proc = spawn(config.ffmpegPath, args);
+    let totalDuration = knownDuration ?? 0;
+    let stderrTail = '';
+
+    proc.stderr.on('data', (chunk: Buffer) => {
+      const text = chunk.toString();
+      stderrTail = (stderrTail + text).slice(-2000);
+
+      if (!totalDuration) {
+        const m = text.match(/Duration:\s*(\d+:\d+:\d+\.?\d*)/);
+        if (m) totalDuration = parseSeconds(m[1]);
+      }
+
+      if (taskId) {
+        const m = text.match(/time=(\d+:\d+:\d+\.?\d*)/);
+        if (m) {
+          if (totalDuration > 0) {
+            const currentTime = parseSeconds(m[1]);
+            const ratio = Math.min(currentTime / totalDuration, 1);
+            const progress = Math.round(progressRange[0] + ratio * (progressRange[1] - progressRange[0]));
+            const updates: any = { progress };
+            if (segmentDuration) {
+              updates.currentVideoIndex = Math.min(Math.floor(currentTime / segmentDuration) + 1, Math.round(totalDuration / segmentDuration));
+            }
+            process.stdout.write(`\r[Task:${taskId}] ${progress}%`);
+            taskService.update(taskId, updates);
+          } else {
+            process.stdout.write(`\r[Task:${taskId}] 处理中 ${m[1].split('.')[0]}`);
+          }
+        }
+      }
+    });
+
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        console.error(`\n[FFmpeg Error] ${stderrTail.slice(-1000)}`);
+        reject(new Error(stderrTail.slice(-500)));
       } else {
         resolve();
       }
     });
+
+    proc.on('error', reject);
   });
 }
 
@@ -47,9 +88,11 @@ async function runWithProgress(command: ffmpeg.FfmpegCommand, taskId: string): P
       })
       .on('progress', (p: { percent?: number }) => {
         const progress = Math.round(p.percent ?? 0);
+        process.stdout.write(`\r[Task:${taskId}] ${progress}%`);
         taskService.update(taskId, { progress });
       })
       .on('end', () => {
+        process.stdout.write(`\r[Task:${taskId}] 100% done\n`);
         taskService.update(taskId, { status: 'completed', progress: 100, output });
         resolve(output);
       })
@@ -247,13 +290,19 @@ export const ffmpegService = {
       const concatLines = ['ffconcat version 1.0', ...videos.map(url => `file '${url}'`)];
       fs.writeFileSync(concatFile, concatLines.join('\n'));
       taskService.update(taskId, { progress: 10 });
+      console.log(`[Task:${taskId}] [1/2] 拼接视频片段 (${videos.length} 个)...`);
 
       mergedFile = path.join(config.outputDir, `${uuidv4()}_merged.mp4`);
-      await runFFmpeg(['-f', 'concat', '-safe', '0', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto', '-i', concatFile, '-c', 'copy', '-y', mergedFile]);
+      const segmentDuration = 8;
+      const totalDuration = videos.length * segmentDuration;
+      taskService.update(taskId, { totalVideos: videos.length });
+      await runFFmpeg(['-f', 'concat', '-safe', '0', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto', '-i', concatFile, '-c', 'copy', '-y', mergedFile], taskId, [10, 75], totalDuration, segmentDuration);
       taskService.update(taskId, { progress: 75 });
+      console.log(`[Task:${taskId}] [1/2] 拼接完成 (75%)`);
 
       // Step 3: 混入背景音乐（或直接输出）
       if (music) {
+        console.log(`[Task:${taskId}] [2/2] 混入背景音乐...`);
         const audioArgs: string[] = ['-i', mergedFile];
         if (music.startsWith('http://') || music.startsWith('https://')) {
           audioArgs.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5');
@@ -272,12 +321,13 @@ export const ffmpegService = {
           );
         }
         audioArgs.push('-c:v', 'copy', '-c:a', 'aac', '-shortest', '-y', out);
-        await runFFmpeg(audioArgs);
+        await runFFmpeg(audioArgs, taskId, [75, 100]);
       } else {
         fs.renameSync(mergedFile, out);
         mergedFile = ''; // 不再删除，已移动到最终输出
       }
 
+      console.log(`[Task:${taskId}] 合并完成 -> ${out}`);
       taskService.update(taskId, { status: 'completed', progress: 100, output: out });
       return out;
     } catch (err: any) {

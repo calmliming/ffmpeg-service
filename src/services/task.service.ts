@@ -33,9 +33,12 @@ class TaskService {
     return this.tasks.get(id);
   }
 
-  update(id: string, updates: Partial<Pick<Task, 'status' | 'progress' | 'output' | 'error'>>) {
+  update(id: string, updates: Partial<Pick<Task, 'status' | 'progress' | 'output' | 'error' | 'currentVideoIndex' | 'totalVideos'>>) {
     const task = this.tasks.get(id);
     if (!task) return;
+    if (updates.status === 'processing' && !task.startedAt) {
+      task.startedAt = new Date();
+    }
     Object.assign(task, updates);
     if (updates.status === 'completed' || updates.status === 'failed') {
       task.completedAt = new Date();

@@ -64,6 +64,10 @@ app.get('/api/tasks/:id', (req, res) => {
   }
 
   const data: any = { ...task };
+  if (task.startedAt) {
+    const end = task.completedAt ?? new Date();
+    data.elapsedSeconds = Math.floor((end.getTime() - task.startedAt.getTime()) / 1000);
+  }
   if (task.output) {
     // 将绝对路径转为下载 URL
     data.downloadUrl = task.output
