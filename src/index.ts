@@ -1,3 +1,4 @@
+import { version } from '../package.json';
 import dotenv from 'dotenv';
 dotenv.config({ path: '.env.local' }); // 本地开发
 dotenv.config(); // 生产环境读 .env
@@ -111,7 +112,6 @@ app.get('/api/tasks/:id/progress', (req, res) => {
 app.use(errorHandler);
 
 const server = app.listen(config.port, () => {
-  const { version } = require('../package.json');
   console.log(`FFmpeg Service v${version} 已启动: http://localhost:${config.port}`);
   console.log(`API 文档:`);
   console.log(`  GET  /api/health              - 健康检查`);

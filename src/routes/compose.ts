@@ -22,7 +22,11 @@ router.post('/', validate(composeSchema), async (req: Request, res: Response) =>
     const { videos, music, musicVolume, muteOriginalAudio } = req.body;
 
     const task = taskService.create('compose');
-    await jobQueue.add('compose', { taskId: task.id, type: 'compose', options: { videos, music, musicVolume, muteOriginalAudio } });
+    await jobQueue.add('compose', {
+      taskId: task.id,
+      type: 'compose',
+      options: { videos, music, musicVolume, muteOriginalAudio },
+    });
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });

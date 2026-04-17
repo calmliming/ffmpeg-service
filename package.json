@@ -7,7 +7,11 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "lint": "eslint src",
+    "lint:fix": "eslint src --fix",
+    "format": "prettier --write src",
+    "format:check": "prettier --check src"
   },
   "dependencies": {
     "bullmq": "^5.74.0",
@@ -27,6 +31,11 @@
     "@types/fluent-ffmpeg": "^2.1.26",
     "@types/multer": "^1.4.12",
     "@types/uuid": "^10.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.58.2",
+    "@typescript-eslint/parser": "^8.58.2",
+    "eslint": "^10.2.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.8.3",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   }
