@@ -430,12 +430,12 @@ curl http://localhost:9527/api/tasks/649ec3c6-8033-4b6b-9d46-a0a2123dcdd2
     "status": "completed",
     "progress": 100,
     "type": "compose",
+    "phase": "merging",
     "createdAt": "2026-04-02T10:25:26.368Z",
     "completedAt": "2026-04-02T10:26:05.422Z",
     "elapsedSeconds": 39,
     "currentVideoIndex": 5,
     "totalVideos": 5,
-    "output": "/path/to/output.mp4",
     "downloadUrl": ["/api/files/output.mp4"]
   }
 }
@@ -445,10 +445,17 @@ curl http://localhost:9527/api/tasks/649ec3c6-8033-4b6b-9d46-a0a2123dcdd2
 
 | 字段 | 类型 | 说明 |
 | ---- | ---- | ---- |
-| `progress` | number | 合并进度 0-100 |
-| `elapsedSeconds` | number | 从开始处理到现在已耗时（秒），完成后为总耗时 |
-| `currentVideoIndex` | number | 当前正在合并第几条视频（仅 compose 任务） |
-| `totalVideos` | number | 本次合并视频总数（仅 compose 任务） |
+| `progress` | number | 进度 0-100 |
+| `phase` | string | **compose 任务专用**：`downloading`（下载视频中）/ `merging`（FFmpeg 合并中） |
+| `elapsedSeconds` | number | 已耗时（秒），任务完成后为总耗时 |
+| `currentVideoIndex` | number | 当前正在下载第几个视频（仅 compose 任务，下载阶段有效） |
+| `totalVideos` | number | 视频总数（仅 compose 任务） |
+| `downloadUrl` | string[] | 完成后的文件路径列表，拼上服务地址即可访问，如 `http://host:9527/api/files/xxx.mp4` |
+
+**compose 任务阶段说明：**
+
+- `progress 0~55%`，`phase = downloading`：逐个下载视频，`currentVideoIndex` 实时更新
+- `progress 55~100%`，`phase = merging`：所有视频下载完毕，FFmpeg 执行合并
 
 **任务状态说明：**
 
