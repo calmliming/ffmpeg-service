@@ -1,6 +1,8 @@
 import ffmpeg from 'fluent-ffmpeg';
 import path from 'path';
 import fs from 'fs';
+import https from 'https';
+import http from 'http';
 import { v4 as uuidv4 } from 'uuid';
 import { config } from '../config';
 import { taskService } from './task.service';
@@ -21,6 +23,49 @@ function escapeDrawtext(text: string): string {
 
 function outputPath(ext: string): string {
   return path.join(config.outputDir, `${uuidv4()}.${ext}`);
+}
+
+const DOWNLOAD_CONCURRENCY = 5;
+
+function downloadToTemp(url: string, destPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const proto = url.startsWith('https') ? https : http;
+    const file = fs.createWriteStream(destPath);
+    proto.get(url, (res) => {
+      if (res.statusCode !== 200) {
+        file.close();
+        fs.unlink(destPath, () => {});
+        reject(new Error(`下载失败 HTTP ${res.statusCode}: ${url}`));
+        return;
+      }
+      res.pipe(file);
+      file.on('finish', () => file.close(resolve as any));
+      file.on('error', (err) => { file.close(); fs.unlink(destPath, () => {}); reject(err); });
+    }).on('error', (err) => { file.close(); fs.unlink(destPath, () => {}); reject(err); });
+  });
+}
+
+async function downloadAllVideos(
+  videos: string[],
+  taskId: string,
+  tempDir: string,
+  onProgress: (finished: number, total: number) => void,
+): Promise<string[]> {
+  const tempPaths = videos.map((_, i) => path.join(tempDir, `${taskId}_dl_${i}.mp4`));
+  let finished = 0;
+
+  for (let i = 0; i < videos.length; i += DOWNLOAD_CONCURRENCY) {
+    const batch = videos.slice(i, i + DOWNLOAD_CONCURRENCY);
+    await Promise.all(
+      batch.map((url, j) =>
+        downloadToTemp(url, tempPaths[i + j]).then(() => {
+          finished++;
+          onProgress(finished, videos.length);
+        }),
+      ),
+    );
+  }
+  return tempPaths;
 }
 
 function parseSeconds(timeStr: string): number {
@@ -270,64 +315,70 @@ export const ffmpegService = {
   /**
    * 合成视频：将多个在线视频 URL 拼接，并可叠加背景音乐。
    *
-   * 采用"分段转码 + concat demuxer"策略，解决低内存服务器崩溃问题：
-   * 1. 每次只处理 1 个视频片段，转码到本地临时文件（控制内存峰值）
-   * 2. 用 -f concat -c copy 拼接所有片段（流复制，几乎不占内存）
-   * 3. 最后单独混入背景音乐
+   * 优化策略：
+   * 1. 并行预下载所有视频到本地（最多 DOWNLOAD_CONCURRENCY 并发），解决串行网络瓶颈
+   * 2. 单遍 FFmpeg：concat demuxer（流复制）+ 背景音乐混入合并为一条命令，消除中间文件
    */
   async compose(taskId: string, options: ComposeOptions): Promise<string> {
     const { videos, music, musicVolume = 1, muteOriginalAudio = false } = options;
     const out = outputPath('mp4');
 
-    taskService.update(taskId, { status: 'processing', progress: 0 });
+    taskService.update(taskId, { status: 'processing', progress: 0, totalVideos: videos.length });
 
     let concatFile = '';
-    let mergedFile = '';
+    let tempPaths: string[] = [];
 
     try {
-      // Step 1: 写 concat 列表，直接引用原始 URL，流复制拼接
-      concatFile = path.join(config.outputDir, `${uuidv4()}_concat.txt`);
-      const concatLines = ['ffconcat version 1.0', ...videos.map(url => `file '${url}'`)];
-      fs.writeFileSync(concatFile, concatLines.join('\n'));
-      taskService.update(taskId, { progress: 10 });
-      console.log(`[Task:${taskId}] [1/2] 拼接视频片段 (${videos.length} 个)...`);
+      // Step 1: 并行下载所有视频到本地临时文件（progress 0 → 55%）
+      console.log(`[Task:${taskId}] [1/2] 并行下载视频 (${videos.length} 个，并发=${DOWNLOAD_CONCURRENCY})...`);
+      tempPaths = await downloadAllVideos(videos, taskId, config.uploadDir, (finished, total) => {
+        const progress = Math.round((finished / total) * 55);
+        taskService.update(taskId, { progress, currentVideoIndex: finished });
+        process.stdout.write(`\r[Task:${taskId}] 下载进度 ${finished}/${total}`);
+      });
+      console.log(`\n[Task:${taskId}] [1/2] 下载完成 (55%)`);
+      taskService.update(taskId, { progress: 55 });
 
-      mergedFile = path.join(config.outputDir, `${uuidv4()}_merged.mp4`);
+      // Step 2: 写 concat 列表（使用本地路径）
+      concatFile = path.join(config.outputDir, `${uuidv4()}_concat.txt`);
+      const concatLines = ['ffconcat version 1.0', ...tempPaths.map(p => `file '${p}'`)];
+      fs.writeFileSync(concatFile, concatLines.join('\n'));
+
+      // Step 3: 单遍 FFmpeg（concat 流复制 + 可选音频混入）
+      console.log(`[Task:${taskId}] [2/2] FFmpeg 合成${music ? ' + 混音' : ''}...`);
       const segmentDuration = 8;
       const totalDuration = videos.length * segmentDuration;
-      taskService.update(taskId, { totalVideos: videos.length });
-      await runFFmpeg(['-f', 'concat', '-safe', '0', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto', '-i', concatFile, '-c', 'copy', '-y', mergedFile], taskId, [10, 75], totalDuration, segmentDuration);
-      taskService.update(taskId, { progress: 75 });
-      console.log(`[Task:${taskId}] [1/2] 拼接完成 (75%)`);
 
-      // Step 3: 混入背景音乐（或直接输出）
       if (music) {
-        console.log(`[Task:${taskId}] [2/2] 混入背景音乐...`);
-        const audioArgs: string[] = ['-i', mergedFile];
+        const ffArgs: string[] = [
+          '-f', 'concat', '-safe', '0', '-i', concatFile,
+        ];
         if (music.startsWith('http://') || music.startsWith('https://')) {
-          audioArgs.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5');
+          ffArgs.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5');
         }
-        audioArgs.push('-i', music);
+        ffArgs.push('-i', music);
 
         if (muteOriginalAudio) {
-          audioArgs.push(
+          ffArgs.push(
             '-filter_complex', `[1:a]volume=${musicVolume}[outa]`,
             '-map', '0:v', '-map', '[outa]',
           );
         } else {
-          audioArgs.push(
+          ffArgs.push(
             '-filter_complex', `[0:a]volume=1[va];[1:a]volume=${musicVolume}[ba];[va][ba]amix=inputs=2:duration=first[outa]`,
             '-map', '0:v', '-map', '[outa]',
           );
         }
-        audioArgs.push('-c:v', 'copy', '-c:a', 'aac', '-shortest', '-y', out);
-        await runFFmpeg(audioArgs, taskId, [75, 100]);
+        ffArgs.push('-c:v', 'copy', '-c:a', 'aac', '-shortest', '-y', out);
+        await runFFmpeg(ffArgs, taskId, [55, 100], totalDuration, segmentDuration);
       } else {
-        fs.renameSync(mergedFile, out);
-        mergedFile = ''; // 不再删除，已移动到最终输出
+        await runFFmpeg(
+          ['-f', 'concat', '-safe', '0', '-i', concatFile, '-c', 'copy', '-y', out],
+          taskId, [55, 100], totalDuration, segmentDuration,
+        );
       }
 
-      console.log(`[Task:${taskId}] 合并完成 -> ${out}`);
+      console.log(`\n[Task:${taskId}] 合成完成 -> ${out}`);
       taskService.update(taskId, { status: 'completed', progress: 100, output: out });
       return out;
     } catch (err: any) {
@@ -335,7 +386,7 @@ export const ffmpegService = {
       throw err;
     } finally {
       if (concatFile) fs.unlink(concatFile, () => {});
-      if (mergedFile) fs.unlink(mergedFile, () => {});
+      for (const p of tempPaths) fs.unlink(p, () => {});
     }
   },
 };
