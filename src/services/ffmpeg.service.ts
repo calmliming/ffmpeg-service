@@ -97,12 +97,12 @@ function runFFmpeg(args: string[], taskId?: string, progressRange: [number, numb
             const currentTime = parseSeconds(m[1]);
             const ratio = Math.min(currentTime / totalDuration, 1);
             const progress = Math.round(progressRange[0] + ratio * (progressRange[1] - progressRange[0]));
-            const updates: any = { progress };
+            const updates: { progress: number; currentVideoIndex?: number } = { progress };
             if (segmentDuration) {
               updates.currentVideoIndex = Math.min(Math.floor(currentTime / segmentDuration) + 1, Math.round(totalDuration / segmentDuration));
             }
             process.stdout.write(`\r[Task:${taskId}] ${progress}%`);
-            taskService.update(taskId, updates);
+            void taskService.update(taskId, updates);
           } else {
             process.stdout.write(`\r[Task:${taskId}] 处理中 ${m[1].split('.')[0]}`);
           }
@@ -129,21 +129,23 @@ async function runWithProgress(command: ffmpeg.FfmpegCommand, taskId: string): P
     command
       .on('start', (cmd: string) => {
         console.log(`[FFmpeg] ${cmd}`);
-        taskService.update(taskId, { status: 'processing', progress: 0 });
+        void taskService.update(taskId, { status: 'processing', progress: 0 });
       })
       .on('progress', (p: { percent?: number }) => {
         const progress = Math.round(p.percent ?? 0);
         process.stdout.write(`\r[Task:${taskId}] ${progress}%`);
-        taskService.update(taskId, { progress });
+        void taskService.update(taskId, { progress });
       })
       .on('end', () => {
         process.stdout.write(`\r[Task:${taskId}] 100% done\n`);
-        taskService.update(taskId, { status: 'completed', progress: 100, output });
-        resolve(output);
+        taskService.update(taskId, { status: 'completed', progress: 100, output })
+          .then(() => resolve(output))
+          .catch(() => resolve(output));
       })
       .on('error', (err: Error) => {
-        taskService.update(taskId, { status: 'failed', error: err.message });
-        reject(err);
+        taskService.update(taskId, { status: 'failed', error: err.message })
+          .then(() => reject(err))
+          .catch(() => reject(err));
       });
 
     // Extract output path from the command
@@ -249,7 +251,7 @@ export const ffmpegService = {
     const folder = config.outputDir;
     const filename = uuidv4();
 
-    taskService.update(taskId, { status: 'processing', progress: 0 });
+    void taskService.update(taskId, { status: 'processing', progress: 0 });
 
     return new Promise((resolve, reject) => {
       ffmpeg(inputPath)
@@ -260,12 +262,14 @@ export const ffmpegService = {
         })
         .on('end', () => {
           const files = options.timestamps.map((_, i) => path.join(folder, `${filename}-${i + 1}.png`));
-          taskService.update(taskId, { status: 'completed', progress: 100, output: files.join(',') });
-          resolve(files);
+          taskService.update(taskId, { status: 'completed', progress: 100, output: files.join(',') })
+            .then(() => resolve(files))
+            .catch(() => resolve(files));
         })
         .on('error', (err: Error) => {
-          taskService.update(taskId, { status: 'failed', error: err.message });
-          reject(err);
+          taskService.update(taskId, { status: 'failed', error: err.message })
+            .then(() => reject(err))
+            .catch(() => reject(err));
         });
     });
   },
@@ -276,7 +280,7 @@ export const ffmpegService = {
     const count = options.count || 6;
     const size = options.size || '320x240';
 
-    taskService.update(taskId, { status: 'processing', progress: 0 });
+    void taskService.update(taskId, { status: 'processing', progress: 0 });
 
     return new Promise((resolve, reject) => {
       ffmpeg(inputPath)
@@ -288,12 +292,14 @@ export const ffmpegService = {
         })
         .on('end', () => {
           const files = Array.from({ length: count }, (_, i) => path.join(folder, `${filename}-${i + 1}.png`));
-          taskService.update(taskId, { status: 'completed', progress: 100, output: files.join(',') });
-          resolve(files);
+          taskService.update(taskId, { status: 'completed', progress: 100, output: files.join(',') })
+            .then(() => resolve(files))
+            .catch(() => resolve(files));
         })
         .on('error', (err: Error) => {
-          taskService.update(taskId, { status: 'failed', error: err.message });
-          reject(err);
+          taskService.update(taskId, { status: 'failed', error: err.message })
+            .then(() => reject(err))
+            .catch(() => reject(err));
         });
     });
   },
@@ -323,7 +329,7 @@ export const ffmpegService = {
     const { videos, music, musicVolume = 1, muteOriginalAudio = false } = options;
     const out = outputPath('mp4');
 
-    taskService.update(taskId, { status: 'processing', progress: 0, totalVideos: videos.length });
+    await taskService.update(taskId, { status: 'processing', progress: 0, totalVideos: videos.length, phase: 'downloading' });
 
     let concatFile = '';
     let tempPaths: string[] = [];
@@ -333,11 +339,11 @@ export const ffmpegService = {
       console.log(`[Task:${taskId}] [1/2] 并行下载视频 (${videos.length} 个，并发=${DOWNLOAD_CONCURRENCY})...`);
       tempPaths = await downloadAllVideos(videos, taskId, config.uploadDir, (finished, total) => {
         const progress = Math.round((finished / total) * 55);
-        taskService.update(taskId, { progress, currentVideoIndex: finished });
+        void taskService.update(taskId, { progress, currentVideoIndex: finished });
         process.stdout.write(`\r[Task:${taskId}] 下载进度 ${finished}/${total}`);
       });
       console.log(`\n[Task:${taskId}] [1/2] 下载完成 (55%)`);
-      taskService.update(taskId, { progress: 55 });
+      await taskService.update(taskId, { progress: 55, phase: 'merging' });
 
       // Step 2: 写 concat 列表（使用本地路径）
       concatFile = path.join(config.outputDir, `${uuidv4()}_concat.txt`);
@@ -379,10 +385,10 @@ export const ffmpegService = {
       }
 
       console.log(`\n[Task:${taskId}] 合成完成 -> ${out}`);
-      taskService.update(taskId, { status: 'completed', progress: 100, output: out });
+      await taskService.update(taskId, { status: 'completed', progress: 100, output: out });
       return out;
     } catch (err: any) {
-      taskService.update(taskId, { status: 'failed', error: err.message });
+      await taskService.update(taskId, { status: 'failed', error: err.message });
       throw err;
     } finally {
       if (concatFile) fs.unlink(concatFile, () => {});

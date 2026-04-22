@@ -12,6 +12,7 @@ services:
 
   ffmpeg-service:
     build: .
+    stop_grace_period: 10m
     ports:
       - "9527:9527"
     environment:

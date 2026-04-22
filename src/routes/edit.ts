@@ -17,8 +17,7 @@ router.post('/trim', upload.single('file'), async (req: Request, res: Response) 
       return;
     }
 
-    const task = taskService.create('trim');
-    task.inputFiles = [req.file.path];
+    const task = await taskService.create('trim', [req.file.path]);
     await jobQueue.add('trim', { taskId: task.id, type: 'trim', inputPath: req.file.path, options: {
       startTime: req.body.startTime,
       endTime: req.body.endTime,
@@ -39,8 +38,7 @@ router.post('/merge', upload.array('files', 10), async (req: Request, res: Respo
       return;
     }
 
-    const task = taskService.create('merge');
-    task.inputFiles = files.map(f => f.path);
+    const task = await taskService.create('merge', files.map(f => f.path));
     await jobQueue.add('merge', { taskId: task.id, type: 'merge', inputPaths: files.map(f => f.path) });
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
   } catch (err: any) {
@@ -56,8 +54,7 @@ router.post('/extract-audio', upload.single('file'), async (req: Request, res: R
       return;
     }
 
-    const task = taskService.create('extract-audio');
-    task.inputFiles = [req.file.path];
+    const task = await taskService.create('extract-audio', [req.file.path]);
     await jobQueue.add('extract-audio', { taskId: task.id, type: 'extract-audio', inputPath: req.file.path, format: req.body.format || 'mp3' });
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
   } catch (err: any) {

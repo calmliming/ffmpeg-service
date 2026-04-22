@@ -19,8 +19,7 @@ router.post('/watermark', upload.fields([
     }
 
     const watermarkImage = files?.image?.[0];
-    const task = taskService.create('watermark');
-    task.inputFiles = [videoFile.path, ...(watermarkImage ? [watermarkImage.path] : [])];
+    const task = await taskService.create('watermark', [videoFile.path, ...(watermarkImage ? [watermarkImage.path] : [])]);
     await jobQueue.add('watermark', { taskId: task.id, type: 'watermark', inputPath: videoFile.path, options: {
       text: req.body.text,
       image: watermarkImage?.path,
@@ -47,8 +46,7 @@ router.post('/screenshot', upload.single('file'), async (req: Request, res: Resp
       return;
     }
 
-    const task = taskService.create('screenshot');
-    task.inputFiles = [req.file.path];
+    const task = await taskService.create('screenshot', [req.file.path]);
     const timeList = typeof timestamps === 'string' ? timestamps.split(',') : timestamps;
     await jobQueue.add('screenshot', { taskId: task.id, type: 'screenshot', inputPath: req.file.path, options: { timestamps: timeList } });
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
@@ -65,8 +63,7 @@ router.post('/thumbnail', upload.single('file'), async (req: Request, res: Respo
       return;
     }
 
-    const task = taskService.create('thumbnail');
-    task.inputFiles = [req.file.path];
+    const task = await taskService.create('thumbnail', [req.file.path]);
     await jobQueue.add('thumbnail', { taskId: task.id, type: 'thumbnail', inputPath: req.file.path, options: {
       count: req.body.count ? Number(req.body.count) : undefined,
       size: req.body.size,
@@ -85,8 +82,7 @@ router.post('/gif', upload.single('file'), async (req: Request, res: Response) =
       return;
     }
 
-    const task = taskService.create('gif');
-    task.inputFiles = [req.file.path];
+    const task = await taskService.create('gif', [req.file.path]);
     await jobQueue.add('gif', { taskId: task.id, type: 'gif', inputPath: req.file.path, options: {
       startTime: req.body.startTime,
       duration: req.body.duration ? Number(req.body.duration) : undefined,

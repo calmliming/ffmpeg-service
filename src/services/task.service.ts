@@ -1,70 +1,75 @@
+import IORedis from 'ioredis';
 import { Task } from '../types';
 import { v4 as uuidv4 } from 'uuid';
 import { EventEmitter } from 'events';
 import fs from 'fs';
+import { config } from '../config';
 
-/** 已完成任务保留时长（毫秒），默认 1 小时 */
-const TASK_TTL = 60 * 60 * 1000;
-/** 清理检查间隔（毫秒），默认 10 分钟 */
-const CLEANUP_INTERVAL = 10 * 60 * 1000;
+const TASK_TTL = 60 * 60; // 1小时，单位秒
+const key = (id: string) => `task:${id}`;
+
+function serialize(task: Task): string {
+  return JSON.stringify(task);
+}
+
+function deserialize(raw: string): Task {
+  const obj = JSON.parse(raw);
+  if (obj.createdAt) obj.createdAt = new Date(obj.createdAt);
+  if (obj.startedAt) obj.startedAt = new Date(obj.startedAt);
+  if (obj.completedAt) obj.completedAt = new Date(obj.completedAt);
+  return obj as Task;
+}
 
 class TaskService {
-  private tasks = new Map<string, Task>();
+  private redis = new IORedis(config.redisUrl, { maxRetriesPerRequest: null });
   private emitter = new EventEmitter();
 
   constructor() {
-    // 定时清理已完成/失败的过期任务
-    setInterval(() => this.cleanup(), CLEANUP_INTERVAL).unref();
+    this.emitter.setMaxListeners(200);
   }
 
-  create(type: string): Task {
+  async create(type: string, inputFiles?: string[]): Promise<Task> {
     const task: Task = {
       id: uuidv4(),
       status: 'pending',
       progress: 0,
       type,
       createdAt: new Date(),
+      ...(inputFiles ? { inputFiles } : {}),
     };
-    this.tasks.set(task.id, task);
+    await this.redis.set(key(task.id), serialize(task), 'EX', TASK_TTL);
     return task;
   }
 
-  get(id: string): Task | undefined {
-    return this.tasks.get(id);
+  async get(id: string): Promise<Task | undefined> {
+    const raw = await this.redis.get(key(id));
+    return raw ? deserialize(raw) : undefined;
   }
 
-  update(id: string, updates: Partial<Pick<Task, 'status' | 'progress' | 'output' | 'error' | 'currentVideoIndex' | 'totalVideos'>>) {
-    const task = this.tasks.get(id);
-    if (!task) return;
+  async update(id: string, updates: Partial<Pick<Task, 'status' | 'progress' | 'output' | 'error' | 'currentVideoIndex' | 'totalVideos' | 'phase'>>): Promise<void> {
+    const raw = await this.redis.get(key(id));
+    if (!raw) return;
+    const task = deserialize(raw);
+
     if (updates.status === 'processing' && !task.startedAt) {
       task.startedAt = new Date();
     }
     Object.assign(task, updates);
+
     if (updates.status === 'completed' || updates.status === 'failed') {
       task.completedAt = new Date();
-      // 清理上传的临时文件
       if (task.inputFiles) {
-        for (const f of task.inputFiles) {
-          fs.unlink(f, () => {});
-        }
+        for (const f of task.inputFiles) fs.unlink(f, () => {});
       }
     }
+
+    await this.redis.set(key(id), serialize(task), 'EX', TASK_TTL);
     this.emitter.emit(`task:${id}`, task);
   }
 
   onProgress(id: string, listener: (task: Task) => void) {
     this.emitter.on(`task:${id}`, listener);
     return () => this.emitter.removeListener(`task:${id}`, listener);
-  }
-
-  private cleanup() {
-    const now = Date.now();
-    for (const [id, task] of this.tasks) {
-      if (task.completedAt && now - task.completedAt.getTime() > TASK_TTL) {
-        this.tasks.delete(id);
-        this.emitter.removeAllListeners(`task:${id}`);
-      }
-    }
   }
 }
 

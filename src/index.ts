@@ -10,7 +10,7 @@ import fs from 'fs';
 import { config } from './config';
 import { errorHandler } from './middleware/error';
 import { taskService } from './services/task.service';
-import './services/queue.service'; // 启动 BullMQ Worker
+import { worker } from './services/queue.service'; // 启动 BullMQ Worker
 import healthRouter from './routes/health';
 import infoRouter from './routes/info';
 import transcodeRouter from './routes/transcode';
@@ -57,20 +57,19 @@ app.use('/api/process', processRouter);
 app.use('/api/compose', composeRouter);
 
 // 任务查询
-app.get('/api/tasks/:id', (req, res) => {
-  const task = taskService.get(req.params.id);
+app.get('/api/tasks/:id', async (req, res) => {
+  const task = await taskService.get(req.params.id);
   if (!task) {
     res.status(404).json({ success: false, error: '任务不存在' });
     return;
   }
 
-  const data: any = { ...task };
+  const data: Record<string, unknown> = { ...task };
   if (task.startedAt) {
     const end = task.completedAt ?? new Date();
     data.elapsedSeconds = Math.floor((end.getTime() - task.startedAt.getTime()) / 1000);
   }
   if (task.output) {
-    // 将绝对路径转为下载 URL
     data.downloadUrl = task.output
       .split(',')
       .map(f => `/api/files/${path.basename(f)}`);
@@ -79,8 +78,8 @@ app.get('/api/tasks/:id', (req, res) => {
 });
 
 // SSE 进度推送
-app.get('/api/tasks/:id/progress', (req, res) => {
-  const task = taskService.get(req.params.id);
+app.get('/api/tasks/:id/progress', async (req, res) => {
+  const task = await taskService.get(req.params.id);
   if (!task) {
     res.status(404).json({ success: false, error: '任务不存在' });
     return;
@@ -129,18 +128,19 @@ const server = app.listen(config.port, () => {
   console.log(`  GET  /api/tasks/:id/progress  - SSE实时进度`);
 });
 
-// 优雅关闭
-function shutdown(signal: string) {
-  console.log(`\n收到 ${signal} 信号，正在关闭服务...`);
-  server.close(() => {
-    console.log('HTTP 服务已关闭');
-    process.exit(0);
-  });
-  // 超时强制退出
-  setTimeout(() => {
+// 优雅关闭：等待当前 ffmpeg 任务完成后再退出
+async function shutdown(signal: string) {
+  console.log(`\n收到 ${signal} 信号，等待当前任务完成后关闭...`);
+  server.close();
+  // 强制超时兜底（与 docker stop_grace_period 对齐）
+  const forceExit = setTimeout(() => {
     console.error('关闭超时，强制退出');
     process.exit(1);
-  }, 30000).unref();
+  }, 600000).unref();
+  await worker.close();
+  clearTimeout(forceExit);
+  console.log('服务已安全关闭');
+  process.exit(0);
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));

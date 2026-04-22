@@ -1,4 +1,5 @@
 export type TaskStatus = 'pending' | 'processing' | 'completed' | 'failed';
+export type TaskPhase = 'downloading' | 'merging';
 
 export interface Task {
   id: string;
@@ -13,6 +14,7 @@ export interface Task {
   startedAt?: Date;
   currentVideoIndex?: number;
   totalVideos?: number;
+  phase?: TaskPhase; // compose 任务专用：downloading（下载中）| merging（合并中）
 }
 
 export interface ApiResponse<T = unknown> {

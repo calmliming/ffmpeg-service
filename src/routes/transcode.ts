@@ -22,8 +22,7 @@ router.post('/', upload.single('file'), async (req: Request, res: Response) => {
       fps: req.body.fps ? Number(req.body.fps) : undefined,
     };
 
-    const task = taskService.create('transcode');
-    task.inputFiles = [req.file.path];
+    const task = await taskService.create('transcode', [req.file.path]);
     await jobQueue.add('transcode', { taskId: task.id, type: 'transcode', inputPath: req.file.path, options });
     res.json({ success: true, data: { taskId: task.id, status: task.status } });
   } catch (err: any) {

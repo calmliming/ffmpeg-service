@@ -17,7 +17,7 @@ type JobPayload = {
   options?: any;
 };
 
-const worker = new Worker<JobPayload>(
+export const worker = new Worker<JobPayload>(
   'ffmpeg',
   async (job: Job<JobPayload>) => {
     const { type, taskId, inputPath, inputPaths, format, options } = job.data;
@@ -52,11 +52,11 @@ const worker = new Worker<JobPayload>(
 );
 
 // 兜底：Worker 内部未捕获的异常更新任务状态
-worker.on('failed', (job, err) => {
+worker.on('failed', async (job, err) => {
   if (job) {
-    const task = taskService.get(job.data.taskId);
+    const task = await taskService.get(job.data.taskId);
     if (task && task.status !== 'failed') {
-      taskService.update(job.data.taskId, { status: 'failed', error: err.message });
+      await taskService.update(job.data.taskId, { status: 'failed', error: err.message });
     }
   }
 });

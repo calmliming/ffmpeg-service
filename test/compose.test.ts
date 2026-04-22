@@ -3,6 +3,10 @@
  * 运行方式：pnpm tsx test/compose.test.ts
  */
 
+import { config } from 'dotenv';
+config({ path: '.env.local' });
+config(); // fallback to .env
+
 const BASE_URL = process.env.API_URL ?? 'http://localhost:9527';
 const POLL_INTERVAL_MS = 3000;
 const TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟
