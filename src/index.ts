@@ -1,143 +1,94 @@
-import { version } from '../package.json';
-import dotenv from 'dotenv';
-dotenv.config({ path: '.env.local' }); // 本地开发
-dotenv.config(); // 生产环境读 .env
-
-import express from 'express';
-import cors from 'cors';
-import path from 'path';
+import './load-env'; // 必须是第一个 import，原因见 load-env.ts
 import fs from 'fs';
+import { version } from '../package.json';
+import { createApp } from './app';
 import { config } from './config';
-import { errorHandler } from './middleware/error';
+import { MAX_PIPELINE_STEPS, PIPELINE_ROUTE } from './core/pipeline';
+import { startWebhookDispatcher } from './core/webhook-dispatcher';
+import { operations } from './operations';
+import { createTaskWorker, getJobQueue } from './services/queue.service';
+import {
+  closeStorage,
+  getS3Client,
+  startOutputRetentionSweeper,
+  storageDriver,
+} from './services/storage.service';
 import { taskService } from './services/task.service';
-import { worker } from './services/queue.service'; // 启动 BullMQ Worker
-import healthRouter from './routes/health';
-import infoRouter from './routes/info';
-import transcodeRouter from './routes/transcode';
-import editRouter from './routes/edit';
-import processRouter from './routes/process';
-import composeRouter from './routes/compose';
 
-const app = express();
+// multer 的磁盘存储不会自己建目录，全新部署（或挂载了空卷）时第一个上传就会 ENOENT
+fs.mkdirSync(config.uploadDir, { recursive: true });
+fs.mkdirSync(config.outputDir, { recursive: true });
 
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// 请求日志
-app.use((req, res, next) => {
-  const start = Date.now();
-  res.on('finish', () => {
-    const ms = Date.now() - start;
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms`);
-  });
-  next();
-});
-
-// 静态文件服务 - 输出文件下载
-app.use('/api/files', (req, res, next) => {
-  if (!config.saveOutputFile) {
-    // 确保文件完全发送后再删除
-    res.on('finish', () => {
-      if (res.statusCode === 200) {
-        const filePath = path.join(config.outputDir, req.path);
-        fs.unlink(filePath, () => {});
-      }
-    });
+// S3 配置写错（AWS 没设区域、endpoint 不是 http(s)、密钥只填了一半）时启动就失败，
+// 而不是等第一个任务跑完上传时才报错、白跑一遍
+if (config.s3.bucket) {
+  try {
+    getS3Client();
+  } catch (err) {
+    console.error(`对象存储配置错误: ${(err as Error).message}`);
+    process.exit(1);
   }
-  next();
-}, express.static(config.outputDir));
+}
 
-// 路由
-app.use('/api/health', healthRouter);
-app.use('/api/info', infoRouter);
-app.use('/api/transcode', transcodeRouter);
-app.use('/api/edit', editRouter);
-app.use('/api/process', processRouter);
-app.use('/api/compose', composeRouter);
+const queue = getJobQueue();
+const worker = createTaskWorker({ operations, tasks: taskService }); // 启动 BullMQ Worker
+const webhooks = startWebhookDispatcher(taskService);
+const stopSweeper = startOutputRetentionSweeper();
+const app = createApp({ operations, tasks: taskService, queue });
 
-// 任务查询
-app.get('/api/tasks/:id', async (req, res) => {
-  const task = await taskService.get(req.params.id);
-  if (!task) {
-    res.status(404).json({ success: false, error: '任务不存在' });
-    return;
-  }
-
-  const data: Record<string, unknown> = { ...task };
-  if (task.startedAt) {
-    const end = task.completedAt ?? new Date();
-    data.elapsedSeconds = Math.floor((end.getTime() - task.startedAt.getTime()) / 1000);
-  }
-  if (task.output) {
-    data.downloadUrl = task.output
-      .split(',')
-      .map(f => `/api/files/${path.basename(f)}`);
-  }
-  res.json({ success: true, data });
-});
-
-// SSE 进度推送
-app.get('/api/tasks/:id/progress', async (req, res) => {
-  const task = await taskService.get(req.params.id);
-  if (!task) {
-    res.status(404).json({ success: false, error: '任务不存在' });
-    return;
-  }
-
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
-
-  // 如果任务已经是终态，直接发送最终状态并关闭
-  if (task.status === 'completed' || task.status === 'failed') {
-    res.write(`data: ${JSON.stringify(task)}\n\n`);
-    res.end();
-    return;
-  }
-
-  const cleanup = taskService.onProgress(req.params.id, (updated) => {
-    res.write(`data: ${JSON.stringify(updated)}\n\n`);
-    if (updated.status === 'completed' || updated.status === 'failed') {
-      res.end();
-    }
-  });
-
-  req.on('close', cleanup);
-});
-
-// 错误处理
-app.use(errorHandler);
-
-const server = app.listen(config.port, () => {
+function printSummary() {
   console.log(`FFmpeg Service v${version} 已启动: http://localhost:${config.port}`);
-  console.log(`API 文档:`);
-  console.log(`  GET  /api/health              - 健康检查`);
-  console.log(`  POST /api/info                - 获取媒体信息`);
-  console.log(`  POST /api/transcode           - 视频转码`);
-  console.log(`  POST /api/edit/trim           - 视频裁剪`);
-  console.log(`  POST /api/edit/merge          - 视频拼接`);
-  console.log(`  POST /api/edit/extract-audio  - 提取音频`);
-  console.log(`  POST /api/process/watermark   - 添加水印`);
-  console.log(`  POST /api/process/screenshot  - 视频截图`);
-  console.log(`  POST /api/process/thumbnail   - 生成缩略图`);
-  console.log(`  POST /api/process/gif         - 视频转GIF`);
-  console.log(`  POST /api/compose             - 在线视频合成(+背景音乐)`);
-  console.log(`  GET  /api/tasks/:id           - 查询任务状态`);
-  console.log(`  GET  /api/tasks/:id/progress  - SSE实时进度`);
+  console.log(
+    `并发 ${config.maxConcurrentTasks} | 存储 ${storageDriver()} | 队列上限 ${config.maxQueueLength || '不限'} | 鉴权 ${config.apiKeys.length ? `已开启（${config.apiKeys.length} 个 Key）` : '未开启'}`,
+  );
+  if (!config.apiKeys.length) {
+    console.warn('[警告] 未配置 API_KEYS，所有接口无需鉴权即可调用。对公网开放前务必设置');
+  }
+  const width = Math.max(28, ...operations.map((op) => op.route.length + 2));
+  const line = (method: string, route: string, title: string) =>
+    console.log(`  ${method.padEnd(4)} ${route.padEnd(width)} ${title}`);
+  console.log(`接口（${operations.length} 个操作）:`);
+  line('GET', '/api/health', '健康检查');
+  line('GET', '/api/operations', '操作列表与参数说明');
+  line('GET', '/api/openapi.json', 'OpenAPI 3.1 文档');
+  for (const op of operations) line('POST', op.route, op.sync ? `${op.title}（同步）` : op.title);
+  line('POST', PIPELINE_ROUTE, `多步骤处理（最多 ${MAX_PIPELINE_STEPS} 步）`);
+  line('GET', '/api/tasks/:id', '查询任务状态');
+  line('GET', '/api/tasks/:id/progress', 'SSE 实时进度');
+  line('POST', '/api/tasks/:id/cancel', '取消任务（同 DELETE /api/tasks/:id）');
+  line('GET', '/api/files/*', '下载产物');
+}
+
+const server = app.listen(config.port, (err?: Error) => {
+  // Express 5 把监听错误交给回调，不处理的话端口被占用时会打印「已启动」却从未监听（Express 4 会直接崩溃退出）
+  if (err) {
+    console.error(`端口 ${config.port} 监听失败: ${err.message}`);
+    process.exit(1);
+  }
+  printSummary();
 });
 
 // 优雅关闭：等待当前 ffmpeg 任务完成后再退出
 async function shutdown(signal: string) {
   console.log(`\n收到 ${signal} 信号，等待当前任务完成后关闭...`);
   server.close();
+  stopSweeper();
   // 强制超时兜底（与 docker stop_grace_period 对齐）
   const forceExit = setTimeout(() => {
     console.error('关闭超时，强制退出');
     process.exit(1);
   }, 600000).unref();
+  // Redis 不可用时 worker.close() 不会返回（BullMQ 各版本都如此，6.x 在启动后从未连上时也会挂住），
+  // 只能干等 600 s。任务状态本来也写不进去，直接退出
+  if (!(await taskService.ping())) {
+    console.error('Redis 不可用，无法等待任务正常结束，直接退出');
+    process.exit(1);
+  }
   await worker.close();
+  // 最后几个任务的回调还在投递，等一会儿再走（超时就放弃）
+  webhooks.stop();
+  await webhooks.drain(15_000);
+  closeStorage();
   clearTimeout(forceExit);
   console.log('服务已安全关闭');
   process.exit(0);
