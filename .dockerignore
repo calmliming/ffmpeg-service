@@ -2,4 +2,11 @@ node_modules
 dist
 uploads/*
 output/*
+test
+.git
 .DS_Store
+*.tgz
+*.tar.gz
+# 配置和密钥（API_KEYS、S3 密钥、WEBHOOK_SECRET）不能进镜像层：docker compose 通过 env_file 在运行时读 .env
+.env
+.env.*

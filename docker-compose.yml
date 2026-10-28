@@ -1,31 +1,186 @@
+# 默认启动 Redis 和服务本身。需要本地对象存储时加上 minio profile：
+#   docker compose --profile minio up -d
+# 构建时 npm / Debian 源太慢，在命令前设置镜像源：
+#   NPM_REGISTRY=https://registry.npmmirror.com APT_MIRROR=http://mirrors.aliyun.com docker compose up -d --build
 services:
   redis:
-    image: redis:7-alpine
+    # Redis 8.10 写出的 RDB v15 格式 7.x 和 8.2 都读不了，升级后不能回退；从 7.x 切换前先备份 redis_data 卷
+    image: redis:8.10.2-trixie
     restart: always
+    # 开启 AOF、每秒 fsync：Redis 被直接杀掉（宿主机或 Docker 崩溃、OOM、docker kill）时最多丢约 1 秒的写入。
+    # 只靠默认的 RDB 快照会退回几分钟前的状态：已完成的任务变回 processing，被当成卡住的任务重跑后失败。
+    # 代价是每次写入多一次追加写，磁盘上多一份 AOF（后台自动重写压缩）。BullMQ 要求 noeviction，这里写明。
+    # 开了 AOF 的 Redis 启动时只读 AOF、不读 dump.rdb，之前没开 AOF 的卷直接带 --appendonly yes 启动会丢光
+    # 队列和任务记录。所以有 dump.rdb 而还没有 AOF 时，先只监听本地 socket 按 RDB 加载、在线打开 AOF
+    # 并等它写完，再正常启动。两次都经过镜像的 docker-entrypoint.sh（切换到 redis 用户、加载模块）
+    command:
+      - sh
+      - -c
+      - |
+        if [ -f /data/dump.rdb ] && [ ! -f /data/appendonlydir/appendonly.aof.manifest ] && [ ! -f /data/appendonly.aof ]; then
+          echo '[aof-init] 首次启用 AOF：先从 dump.rdb 加载现有数据并生成 AOF'
+          sock=/tmp/aof-init.sock
+          docker-entrypoint.sh redis-server --port 0 --unixsocket $$sock --appendonly no &
+          pid=$$!
+          until [ "$$(redis-cli -s $$sock ping 2>/dev/null)" = PONG ]; do
+            kill -0 $$pid 2>/dev/null || exit 1
+            sleep 1
+          done
+          redis-cli -s $$sock config set appendonly yes
+          until [ -f /data/appendonlydir/appendonly.aof.manifest ] &&
+            redis-cli -s $$sock info persistence | grep -q '^aof_rewrite_in_progress:0'; do
+            kill -0 $$pid 2>/dev/null || exit 1
+            sleep 1
+          done
+          redis-cli -s $$sock shutdown
+          wait $$pid
+          echo '[aof-init] AOF 已生成'
+        fi
+        exec docker-entrypoint.sh redis-server --appendonly yes --appendfsync everysec --maxmemory-policy noeviction
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ['CMD', 'redis-cli', 'ping']
       interval: 10s
       timeout: 5s
       retries: 3
+      # 首次启用 AOF 时要先加载并重写一遍数据，期间不监听端口
+      start_period: 30s
 
   ffmpeg-service:
-    build: .
+    build:
+      context: .
+      args:
+        - NPM_REGISTRY=${NPM_REGISTRY:-https://registry.npmjs.org}
+        - APT_MIRROR=${APT_MIRROR:-}
     stop_grace_period: 10m
     ports:
-      - "9527:9527"
+      - '9527:9527'
+    # .env 不打进镜像，运行时从这里注入；改了 .env 之后执行 docker compose up -d 重建容器即可，不用重新构建。
+    # 值里有 $ 时用单引号括起来，否则 compose 会把它当变量替换
+    env_file: .env
+    # environment 的优先级高于 .env
     environment:
+      # 镜像里的路径和端口，固定不变
+      - PORT=9527
+      - FFMPEG_PATH=ffmpeg
+      - FFPROBE_PATH=ffprobe
       - REDIS_URL=redis://redis:6379
       - MAX_CONCURRENT_TASKS=3
       - SAVE_OUTPUT_FILE=true
+      # ---- 以下为可选配置示例，取消注释后生效。密钥类配置建议写进 .env，不要提交到公开仓库 ----
+      # 鉴权：逗号分隔的 API Key，请求带 Authorization: Bearer <key> 或 X-API-Key。不设时所有接口无需鉴权
+      # - API_KEYS=change-me-1,change-me-2
+      # /api/files 下载也要求 API Key（默认不要求，文件名是随机 UUID）
+      # - PROTECT_FILES=true
+      # 服务对外地址：回调和任务详情里的下载链接会变成绝对地址
+      # - PUBLIC_BASE_URL=https://media.example.com
+      # 回调签名密钥：回调请求带 HMAC-SHA256 签名头，接收方据此校验
+      # - WEBHOOK_SECRET=change-me
+      # 本地产物保留小时数，到期后台自动删除（0 = 永久保留）
+      # - OUTPUT_RETENTION_HOURS=72
+      # 排队任务超过这个数时新提交返回 429（0 = 不限）
+      # - MAX_QUEUE_LENGTH=100
+      # 单个上传文件上限（MB）
+      # - MAX_UPLOAD_MB=500
+      # 允许下载内网 / 回环地址的输入文件和向内网发回调（默认拒绝，防 SSRF）。用下面的 minio 当输入源时需要
+      # - ALLOW_PRIVATE_URLS=true
+      # 文字水印、烧录字幕用的字体。镜像默认 FONT_NAME=Noto Sans CJK SC（思源黑体简体）；
+      # FONT_FILE 指向挂载进来的字体文件时，水印和烧录字幕都优先用它（.ttc 字体集：水印只能用第 0 个字体，字幕可用 FONT_NAME 挑选）
+      # - FONT_NAME=Noto Sans CJK SC
+      # - FONT_FILE=/fonts/MyFont.ttf
+      # ---- 对象存储（S3 兼容）：设置 S3_BUCKET 才启用，产物上传后默认删除本地副本 ----
+      # - S3_BUCKET=ffmpeg-output
+      # - S3_REGION=us-east-1
+      # AWS S3 不用设 S3_ENDPOINT；R2、MinIO、OSS 等填各自的地址
+      # - S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+      # - S3_ACCESS_KEY_ID=
+      # - S3_SECRET_ACCESS_KEY=
+      # MinIO 等不支持虚拟主机风格（bucket.endpoint）时设为 true
+      # - S3_FORCE_PATH_STYLE=true
+      # - S3_PREFIX=ffmpeg/outputs
+      # 设置后下载地址是 <S3_PUBLIC_BASE_URL>/<key>（公开读的桶或 CDN），否则返回预签名链接
+      # - S3_PUBLIC_BASE_URL=https://cdn.example.com
+      # - S3_PRESIGN_EXPIRES_SECONDS=604800
+      # - S3_KEEP_LOCAL_COPY=false
     depends_on:
       redis:
         condition: service_healthy
     restart: always
+    # 服务以镜像里的 node 用户（uid 1000）运行，两个卷第一次创建时自动归它所有。
+    # 挂载宿主机目录（bind mount）代替卷时，要先 chown -R 1000:1000 那个目录
     volumes:
       - output_data:/app/output
+      # 上传的输入文件和任务临时目录。排队中的任务只在 Redis 里记着文件路径，
+      # 不放在卷上的话重建容器（更新镜像、改 .env 后 docker compose up -d）后这些任务全部失败
+      - upload_data:/app/uploads
+      # 自定义字体：挂载字体目录，再设置 FONT_FILE（文件要对 uid 1000 可读）
+      # - ./fonts:/fonts:ro
+    healthcheck:
+      # /api/health 不需要 API Key；Redis 或 FFmpeg 不可用时返回 503
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:9527/api/health').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+  # 可选的本地对象存储，只有 --profile minio 时才启动。
+  # MinIO 官方从 2025 年 10 月起不再发布 Docker 镜像，这里用 Pigsty 维护的社区构建（同一份 AGPL 源码），按发布版本钉住。
+  # 服务这边的配置（S3_BUCKET 与 MINIO_BUCKET 一致）：
+  #   S3_BUCKET=ffmpeg-output  S3_REGION=us-east-1  S3_FORCE_PATH_STYLE=true
+  #   S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY 同 MINIO_ROOT_USER / MINIO_ROOT_PASSWORD（正式使用时另建只有这个桶权限的用户）
+  # 预签名链接里的主机名就是 S3_ENDPOINT，客户端必须能访问它：
+  #   - 预签名模式：S3_ENDPOINT=http://<服务器地址>:9000（容器和客户端都能访问的地址），并把 MINIO_BIND 设为 0.0.0.0
+  #   - 公开地址模式：S3_ENDPOINT=http://minio:9000，S3_PUBLIC_BASE_URL=http://<服务器地址>:9000/ffmpeg-output，
+  #     MINIO_PUBLIC_READ=true 让 minio-init 把桶设成可匿名下载，MINIO_BIND 同样设为 0.0.0.0
+  # 以上 MINIO_* 变量写在 .env 或命令前，由 compose 替换进下面的配置
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    profiles: ['minio']
+    command: ['minio', 'server', '/data', '--console-address', ':9001']
+    restart: always
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+    # 默认只监听本机：默认密码的 MinIO 不能直接暴露到公网
+    ports:
+      - '${MINIO_BIND:-127.0.0.1}:9000:9000'
+      - '127.0.0.1:9001:9001'
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ['CMD', 'mc', 'ready', 'local']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 一次性任务：MinIO 就绪后创建存储桶（已存在时跳过）
+  minio-init:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    profiles: ['minio']
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - MINIO_BUCKET=${MINIO_BUCKET:-ffmpeg-output}
+      - MINIO_PUBLIC_READ=${MINIO_PUBLIC_READ:-false}
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        mc alias set svc http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        && mc mb --ignore-existing "svc/$$MINIO_BUCKET"
+        && if [ "$$MINIO_PUBLIC_READ" = true ]; then mc anonymous set download "svc/$$MINIO_BUCKET"; fi
+    restart: 'no'
 
 volumes:
   redis_data:
   output_data:
+  upload_data:
+  minio_data:
