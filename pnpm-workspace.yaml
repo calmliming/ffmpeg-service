@@ -1,0 +1,8 @@
+# pnpm 11 起默认拒绝未声明的依赖安装脚本（ERR_PNPM_IGNORED_BUILDS），每一项都必须显式写 true 或 false。
+# 这两个包的原生二进制都通过 optionalDependencies 下载预编译包，安装脚本只在缺预编译包时回退本地编译，
+# 而 node:*-slim 镜像里没有编译工具，所以一律关闭。
+allowBuilds:
+  esbuild: false
+  msgpackr-extract: false
+# pnpm 12 默认只安装发布满 1 天的版本（minimumReleaseAge），防止装到刚发布就被投毒的包。
+# 不要用 minimumReleaseAgeExclude 绕过：显式 add 太新的版本时 pnpm 会自动写入排除项，删掉后改用稍旧的版本
