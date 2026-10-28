@@ -16,6 +16,7 @@
 | `-safe` | `0` | concat 模式下允许使用绝对路径 |
 | `-ss` / `-setStartTime` | `HH:MM:SS` | 从指定时间开始读取输入 |
 | `-to` | `HH:MM:SS` | 读取到指定时间点 |
+| `-f lavfi -i anullsrc` | `r=48000:cl=stereo` | 生成静音音轨，给没有音轨的片段补声音 |
 
 ---
 
@@ -46,7 +47,7 @@
 | `-ar` | `44100` | 采样率 44100 Hz |
 | `-ac` | `2` | 双声道（立体声） |
 | `-an` | — | 去除音频轨（静音输出） |
-| `-shortest` | — | 以最短的输入流为准截断输出 |
+| `-shortest` | — | 以最短的输入流为准截断输出。重新编码画面时会让音轨多出约 0.5 秒，统一转码片段时改用 `-t` |
 
 ---
 
@@ -151,6 +152,24 @@ overlay=main_w-overlay_w-10:main_h-overlay_h-10
 |---|---|
 | `inputs=2` | 混合 2 路音频 |
 | `duration=first` | 以第一路音频时长为准截断 |
+| `normalize=0` | 关闭自动归一化。默认会把每路都除以路数，原声被减半，音乐结束后原声又跳回原音量 |
+| `dropout_transition=0` | 某一路结束时不做渐变 |
+
+### apad — 补静音
+
+```
+[1:a]volume=0.8,apad[outa]
+```
+
+把音频在结尾无限补静音，配合 `-shortest` 或 `-t` 使用，保证音乐比视频短时视频不会被截断。
+
+### alimiter — 限幅
+
+```
+alimiter=limit=0.97:level=0
+```
+
+峰值超过 `limit` 时压缩，防止原声和音乐叠加后爆音。`level=0` 关闭自动增益，正常音量下不改变响度。
 
 ---
 
@@ -162,27 +181,43 @@ overlay=main_w-overlay_w-10:main_h-overlay_h-10
 | `-map [outv]` | 选取 filter_complex 输出的视频流 |
 | `-map [outa]` | 选取 filter_complex 输出的音频流 |
 | `-y` | 输出文件已存在时直接覆盖 |
+| `-t` | 输出到指定时长为止 |
+| `-movflags +faststart` | 把 MP4 索引移到文件头，浏览器可以边下边播 |
+| `-progress pipe:1` | 把机器可读的进度输出到 stdout，服务用它计算任务进度 |
 
 ---
 
 ## compose 接口完整流程示意
 
 ```
-输入：N 个视频 URL + 1 个音乐 URL
+输入：N 个视频 URL + 可选 1 个音乐 URL
 
-Step 1: 逐个转码（内存峰值 ~100MB）
-  每个视频 URL
-    → ffmpeg -i URL -vf scale=1280:720... -c:v libx264 -preset veryfast -crf 23 -threads 2 seg_N.mp4
+Step 1: 下载（progress 0~55%）
+  视频和音乐全部下载到 uploads/，默认 3 路并发
+  网络中断、超时、5xx、文件不完整自动重试，默认 3 次
 
-Step 2: 流复制拼接（内存极低）
+Step 2: ffprobe 检查每个片段的编码、分辨率、帧率、音轨
+
+Step 3（仅参数不一致时）: 逐个统一转码，一次只转一个控制内存
+  → ffmpeg -i seg_N.mp4 [-f lavfi -i anullsrc=r=48000:cl=stereo]
+      -map 0:v:0 -vf scale=W:H:force_original_aspect_ratio=decrease,pad=W:H:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=FPS,format=yuv420p
+      -c:v libx264 -preset veryfast -crf 23
+      -map 0:a:0 -af apad -c:a aac -ar 48000 -ac 2 -t <画面时长> norm_N.mp4
+  W、H、FPS 取第 1 个视频的参数；缺音轨的片段改用 anullsrc 补静音
+
+Step 4: concat 流复制拼接 + 可选混音，一条命令完成
   concat.txt:
     file 'seg_0.mp4'
     file 'seg_1.mp4'
     ...
-  → ffmpeg -f concat -safe 0 -i concat.txt -c copy merged.mp4
-
-Step 3: 混入背景音乐
-  → ffmpeg -i merged.mp4 -i music.mp3
-      -filter_complex "[0:a]volume=1[va];[1:a]volume=0.6[ba];[va][ba]amix=inputs=2:duration=first[outa]"
-      -map 0:v -map [outa] -c:v copy -c:a aac -shortest output.mp4
+  无音乐：
+  → ffmpeg -f concat -safe 0 -i concat.txt -c copy -movflags +faststart output.mp4
+  有音乐、保留原声：
+  → ffmpeg -f concat -safe 0 -i concat.txt -i music
+      -filter_complex "[1:a]volume=0.8[bgm];[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.97:level=0[outa]"
+      -map 0:v -map [outa] -c:v copy -c:a aac -shortest -movflags +faststart output.mp4
+  有音乐、消除原声：
+  → ffmpeg -f concat -safe 0 -i concat.txt -i music
+      -filter_complex "[1:a]volume=0.8,apad[outa]"
+      -map 0:v -map [outa] -c:v copy -c:a aac -shortest -movflags +faststart output.mp4
 ```

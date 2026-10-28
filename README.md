@@ -1,15 +1,31 @@
-# FFmpeg Service 接口文档
+# FFmpeg Service
 
-## 概述
+FFmpeg Service 把 FFmpeg 封装成 HTTP 接口，基于 Node.js / TypeScript、Express 和 BullMQ（Redis）。共 58 个操作：
 
-FFmpeg Service 是一个基于 Node.js/TypeScript 的 RESTful API 服务，将 FFmpeg 的常用功能封装为 HTTP 接口，支持视频转码、剪辑、处理、在线合成等功能。
+- **转码与剪辑**：格式转换、裁剪片段、拼接（可加转场）、提取音频、转 GIF / WebP、变速、倒放、循环、淡入淡出、删除片段、分段
+- **画面**：水印（文字 / 图片）、截图、缩略图、预览雪碧图、批量抽帧、封面、裁剪画面、缩放、横竖屏转换、旋转翻转、画中画、多画面拼接
+- **特效与压缩**：区域模糊 / 打码、去水印、调色、降噪锐化、防抖、去掉音轨、按目标大小或质量压缩
+- **字幕与合成**：烧录或内嵌字幕、加配乐、音频生成视频、图片幻灯片、多个在线视频合成并加背景音乐
+- **音频**：格式转换、响度标准化、降噪、去静音、音量、淡入淡出、变速变调、裁剪、倒放、拼接、混音、波形图、频谱图
+- **分析与流媒体**：媒体信息、响度、场景切换、静音、黑屏检测、波形峰值数据、HLS / DASH 切片、图片格式转换
+
+所有接口都支持：上传文件或给链接两种输入方式、异步任务与进度查询（轮询 / SSE）、取消任务、完成回调（HMAC 签名）、多步串联（`/api/pipeline`）、产物存本地或 S3 兼容对象存储。可选 API Key 鉴权，输入链接和回调地址有 SSRF 防护。
 
 - **基础地址**: `http://localhost:9527`
 - **线上测试地址**: `http://124.221.157.202:9527`
-- **最大上传文件**: 500MB
-- **支持格式**: video/\*、audio/\*、image/\*
+- **完整接口文档**: [Fmpeg API Documentation.md](Fmpeg%20API%20Documentation.md)（调用约定、任务、回调、串联、每个接口的参数）
+- **部署**: [部署指南.md](部署指南.md)
+- **机器可读的接口说明**: `GET /api/operations`、`GET /api/openapi.json`（OpenAPI 3.1）
 
 ## 快速开始
+
+环境要求：Node.js 24 LTS（版本见 `.nvmrc`）、pnpm 12（由 `package.json` 的 `packageManager` 指定）、FFmpeg（生产镜像为 9.0.2）、Redis。Node 24 自带 corepack，首次使用前执行一次：
+
+```bash
+corepack enable
+```
+
+如果之前全局装过 pnpm 10，在 Windows 上要先升级到 10.34.5 以上，或者卸载后改用 corepack，否则在本项目里执行任何 pnpm 命令都会报找不到 pnpm。
 
 ```bash
 # 安装依赖
@@ -21,534 +37,194 @@ pnpm dev
 # 生产构建 & 启动
 pnpm build
 pnpm start
+
+# 单元测试
+pnpm test
 ```
 
-## 统一响应格式
+本地运行需要一个 Redis，默认连 `redis://localhost:6379`，可以用 `docker run -d -p 127.0.0.1:6379:6379 redis:8.10.2-trixie` 启动。只绑定本机地址：这个 Redis 没有密码，任何能连上它的人都能改任务记录、往队列里塞任务。
 
-```json
-{
-  "success": true,
-  "data": { ... }
-}
-```
+仓库里的 `.env.local` 会在本地开发时加载。只有 ffmpeg 不在 PATH 中时，才需要在里面设置 `FFMPEG_PATH`。Windows 上的 FFmpeg 通常没有字体配置，文字水印和字幕默认使用系统里的微软雅黑。
 
-错误响应：
+**测试说明**
 
-```json
-{
-  "success": false,
-  "error": "错误信息"
-}
-```
+- 处理类测试会用本机 ffmpeg 现场生成小素材并真实执行，没有 ffmpeg 时自动跳过；CI 里设置 `FFMPEG_REQUIRED=1` 让它直接报错。
+- 引擎测试需要 Redis，默认连 `redis://localhost:6379/15`（只读写自己前缀的 key，不清库），可用 `TEST_REDIS_URL` 指定别的实例。
+- 对象存储测试需要 MinIO，默认连 `http://127.0.0.1:9000`（`MINIO_TEST_ENDPOINT`），连不上时跳过。
 
-## 异步任务机制
-
-所有耗时操作（转码、剪辑、合成等）均为异步处理：
-
-1. 提交请求 → 立即返回 `taskId`
-2. 通过 **轮询** 或 **SSE** 获取任务进度
-3. 任务完成后通过 `downloadUrl` 下载结果文件
-
----
-
-## 接口列表
-
-### 1. 健康检查
-
-**`GET /api/health`**
-
-检查服务运行状态和 FFmpeg 可用性。
-
-**请求示例：**
+## 调用示例
 
 ```bash
-curl http://localhost:9527/api/health
-```
-
-**响应示例：**
-
-```json
-{
-  "success": true,
-  "data": {
-    "service": "ffmpeg-service",
-    "status": "running",
-    "ffmpeg": "available",
-    "timestamp": "2026-04-02T08:00:00.000Z"
-  }
-}
-```
-
----
-
-### 2. 获取媒体信息
-
-**`POST /api/info`**
-
-获取音视频文件的元信息（时长、分辨率、编码、码率等）。
-
-**请求方式：** `multipart/form-data`
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| file | File | 是 | 音视频文件 |
-
-**请求示例：**
-
-```bash
-curl -X POST http://localhost:9527/api/info \
-  -F "file=@video.mp4"
-```
-
-**响应示例：**
-
-```json
-{
-  "success": true,
-  "data": {
-    "streams": [
-      {
-        "codec_name": "h264",
-        "width": 1920,
-        "height": 1080,
-        "duration": "10.000000"
-      }
-    ],
-    "format": {
-      "duration": "10.000000",
-      "size": "5242880",
-      "bit_rate": "4194304"
-    }
-  }
-}
-```
-
----
-
-### 3. 视频转码 / 格式转换
-
-**`POST /api/transcode`**
-
-将视频转换为其他格式，支持自定义编码器、码率、分辨率等。
-
-**请求方式：** `multipart/form-data`
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| file | File | 是 | 视频文件 |
-| format | string | 否 | 输出格式，默认 `mp4`（可选 `webm`、`avi`、`mkv` 等） |
-| videoCodec | string | 否 | 视频编码器（如 `libx264`、`libvpx`） |
-| audioCodec | string | 否 | 音频编码器（如 `aac`、`libmp3lame`） |
-| videoBitrate | string | 否 | 视频码率（如 `1000k`） |
-| audioBitrate | string | 否 | 音频码率（如 `128k`） |
-| resolution | string | 否 | 分辨率（如 `1280x720`） |
-| fps | number | 否 | 帧率 |
-
-**请求示例：**
-
-```bash
-curl -X POST http://localhost:9527/api/transcode \
-  -F "file=@video.mp4" \
-  -F "format=webm" \
-  -F "resolution=1280x720" \
-  -F "videoBitrate=1000k"
-```
-
-**响应示例：**
-
-```json
-{
-  "success": true,
-  "data": {
-    "taskId": "550e8400-e29b-41d4-a716-446655440000",
-    "status": "pending"
-  }
-}
-```
-
----
-
-### 4. 视频裁剪
-
-**`POST /api/edit/trim`**
-
-按时间段裁剪视频。
-
-**请求方式：** `multipart/form-data`
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| file | File | 是 | 视频文件 |
-| startTime | string | 是 | 起始时间，格式 `HH:MM:SS`（如 `00:00:05`） |
-| endTime | string | 否 | 结束时间，格式 `HH:MM:SS` |
-| duration | number | 否 | 持续秒数（与 endTime 二选一） |
-
-**请求示例：**
-
-```bash
-curl -X POST http://localhost:9527/api/edit/trim \
-  -F "file=@video.mp4" \
-  -F "startTime=00:00:05" \
-  -F "duration=10"
-```
-
----
-
-### 5. 视频拼接
-
-**`POST /api/edit/merge`**
-
-将多个视频文件拼接为一个。
-
-**请求方式：** `multipart/form-data`
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| files | File[] | 是 | 视频文件列表（2-10 个） |
-
-**请求示例：**
-
-```bash
-curl -X POST http://localhost:9527/api/edit/merge \
-  -F "files=@video1.mp4" \
-  -F "files=@video2.mp4" \
-  -F "files=@video3.mp4"
-```
-
----
-
-### 6. 提取音频
-
-**`POST /api/edit/extract-audio`**
-
-从视频中提取音频轨道。
-
-**请求方式：** `multipart/form-data`
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| file | File | 是 | 视频文件 |
-| format | string | 否 | 音频格式，默认 `mp3`（可选 `aac`、`wav`、`flac`） |
-
-**请求示例：**
-
-```bash
-curl -X POST http://localhost:9527/api/edit/extract-audio \
-  -F "file=@video.mp4" \
-  -F "format=wav"
-```
-
----
-
-### 7. 添加水印
-
-**`POST /api/process/watermark`**
-
-为视频添加文字水印或图片水印。
-
-**请求方式：** `multipart/form-data`
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| file | File | 是 | 视频文件 |
-| text | string | 否 | 文字水印内容（与 image 二选一） |
-| image | File | 否 | 图片水印文件（与 text 二选一） |
-| position | string | 否 | 水印位置，默认 `bottom-right` |
-| fontSize | number | 否 | 文字大小，默认 `24` |
-| fontColor | string | 否 | 文字颜色，默认 `white` |
-
-**position 可选值：**
-`top-left`、`top-right`、`bottom-left`、`bottom-right`、`center`
-
-**请求示例：**
-
-```bash
-# 文字水印
-curl -X POST http://localhost:9527/api/process/watermark \
-  -F "file=@video.mp4" \
-  -F "text=Hello World" \
-  -F "position=top-right" \
-  -F "fontSize=36" \
-  -F "fontColor=yellow"
-
-# 图片水印
-curl -X POST http://localhost:9527/api/process/watermark \
-  -F "file=@video.mp4" \
-  -F "image=@logo.png" \
-  -F "position=bottom-right"
-```
-
----
-
-### 8. 视频截图
-
-**`POST /api/process/screenshot`**
-
-在指定时间点截取视频画面。
-
-**请求方式：** `multipart/form-data`
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| file | File | 是 | 视频文件 |
-| timestamps | string | 是 | 截图时间点，逗号分隔（如 `00:00:05,00:00:10`） |
-
-**请求示例：**
-
-```bash
-curl -X POST http://localhost:9527/api/process/screenshot \
-  -F "file=@video.mp4" \
-  -F "timestamps=00:00:02,00:00:05,00:00:08"
-```
-
----
-
-### 9. 生成缩略图
-
-**`POST /api/process/thumbnail`**
-
-自动从视频中均匀截取多张缩略图。
-
-**请求方式：** `multipart/form-data`
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| file | File | 是 | 视频文件 |
-| count | number | 否 | 缩略图数量，默认 `6` |
-| size | string | 否 | 缩略图尺寸，默认 `320x240` |
-
-**请求示例：**
-
-```bash
-curl -X POST http://localhost:9527/api/process/thumbnail \
-  -F "file=@video.mp4" \
-  -F "count=8" \
-  -F "size=640x360"
-```
-
----
-
-### 10. 视频转 GIF
-
-**`POST /api/process/gif`**
-
-将视频片段转换为 GIF 动图。
-
-**请求方式：** `multipart/form-data`
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| file | File | 是 | 视频文件 |
-| startTime | string | 否 | 起始时间（如 `00:00:02`） |
-| duration | number | 否 | 持续秒数 |
-| width | number | 否 | GIF 宽度，默认 `320`（高度自适应） |
-| fps | number | 否 | 帧率，默认 `10` |
-
-**请求示例：**
-
-```bash
-curl -X POST http://localhost:9527/api/process/gif \
-  -F "file=@video.mp4" \
-  -F "startTime=00:00:02" \
-  -F "duration=5" \
-  -F "width=480" \
-  -F "fps=15"
-```
-
----
-
-### 11. 在线视频合成（+ 背景音乐）
-
-**`POST /api/compose`**
-
-将多个在线视频 URL 拼接合成，并可叠加背景音乐。无需下载文件，直接传入 URL。
-
-**请求方式：** `application/json`
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| videos | string[] | 是 | 视频 URL 列表 |
-| music | string | 否 | 背景音乐 URL |
-| musicVolume | number | 否 | 音乐音量，范围 `0-1`，默认 `1` |
-| muteOriginalAudio | boolean | 否 | 是否消除视频原声，默认 `false` |
-
-**请求示例：**
-
-```bash
-curl -X POST http://localhost:9527/api/compose \
+# 1. 提交任务：上传文件
+curl -X POST http://localhost:9527/api/video/crop -F "file=@input.mp4" -F "aspect=9:16"
+# {"success":true,"data":{"taskId":"3b5c9f0e-…","status":"pending"}}
+
+#    或者给链接，并在完成后回调
+curl -X POST http://localhost:9527/api/video/crop \
   -H "Content-Type: application/json" \
-  -d '{
-    "videos": [
-      "https://example.com/video1.mp4",
-      "https://example.com/video2.mp4",
-      "https://example.com/video3.mp4"
-    ],
-    "music": "https://example.com/bgm.mp3",
-    "musicVolume": 0.8
-  }'
+  -d '{"url": "https://example.com/input.mp4", "aspect": "9:16", "callbackUrl": "https://example.com/hooks/ffmpeg"}'
+
+# 2. 查询进度（也可以订阅 SSE：GET /api/tasks/<taskId>/progress）
+curl http://localhost:9527/api/tasks/<taskId>
+
+# 3. 完成后按 primaryUrl / downloadUrl 下载
+curl -O http://localhost:9527/api/files/<文件名>.mp4
+
+# 多步串联：裁剪片段 → 竖屏 → 切成 HLS
+curl -X POST http://localhost:9527/api/pipeline -F "file=@input.mp4" \
+  -F 'steps=[{"op":"trim","params":{"startTime":0,"duration":30}},{"op":"video.reframe","params":{"aspect":"9:16"}},{"op":"video.hls"}]'
 ```
 
-**响应示例：**
+## 接口一览
 
-```json
-{
-  "success": true,
-  "data": {
-    "taskId": "649ec3c6-8033-4b6b-9d46-a0a2123dcdd2",
-    "status": "pending"
-  }
-}
-```
+点击接口地址查看参数。「串联」表示可以作为 `/api/pipeline` 的中间步骤。
 
-**说明：**
-- 视频会自动统一缩放至 1280x720 分辨率
-- 默认原始视频音频与背景音乐自动混合
-- 设置 `muteOriginalAudio: true` 可消除视频原声，仅保留背景音乐
-- 输出时长以视频总时长为准（音乐不够会自动结束，音乐过长会截断）
+<!-- BEGIN GENERATED: operation-index -->
+**基础接口（兼容旧版）**
 
----
+| 接口 | 功能 | 串联 |
+| --- | --- | --- |
+| [`/api/info`](Fmpeg%20API%20Documentation.md#op-info) | 获取媒体信息（同步） |  |
+| [`/api/transcode`](Fmpeg%20API%20Documentation.md#op-transcode) | 转码 / 格式转换 | ✓ |
+| [`/api/edit/trim`](Fmpeg%20API%20Documentation.md#op-trim) | 裁剪片段 | ✓ |
+| [`/api/edit/extract-audio`](Fmpeg%20API%20Documentation.md#op-extract-audio) | 提取音频 | ✓ |
+| [`/api/process/gif`](Fmpeg%20API%20Documentation.md#op-gif) | 视频转动图 | ✓ |
 
-### 12. 查询任务状态
+**截图、水印与合成**
 
-**`GET /api/tasks/:id`**
+| 接口 | 功能 | 串联 |
+| --- | --- | --- |
+| [`/api/process/watermark`](Fmpeg%20API%20Documentation.md#op-watermark) | 添加水印 | ✓ |
+| [`/api/process/screenshot`](Fmpeg%20API%20Documentation.md#op-screenshot) | 视频截图 |  |
+| [`/api/process/thumbnail`](Fmpeg%20API%20Documentation.md#op-thumbnail) | 生成缩略图 |  |
+| [`/api/compose`](Fmpeg%20API%20Documentation.md#op-compose) | 视频合成（拼接 + 背景音乐） |  |
+| [`/api/video/sprite`](Fmpeg%20API%20Documentation.md#op-video-sprite) | 进度条预览雪碧图 |  |
+| [`/api/video/frames`](Fmpeg%20API%20Documentation.md#op-video-frames) | 批量抽帧 |  |
+| [`/api/video/cover`](Fmpeg%20API%20Documentation.md#op-video-cover) | 智能封面 | ✓ |
 
-查询异步任务的当前状态和进度。
+**画面尺寸与布局**
 
-**请求示例：**
+| 接口 | 功能 | 串联 |
+| --- | --- | --- |
+| [`/api/video/crop`](Fmpeg%20API%20Documentation.md#op-video-crop) | 裁剪画面 | ✓ |
+| [`/api/video/resize`](Fmpeg%20API%20Documentation.md#op-video-resize) | 缩放画面 | ✓ |
+| [`/api/video/reframe`](Fmpeg%20API%20Documentation.md#op-video-reframe) | 改画幅（横转竖） | ✓ |
+| [`/api/video/rotate`](Fmpeg%20API%20Documentation.md#op-video-rotate) | 旋转 / 翻转 | ✓ |
+| [`/api/video/pip`](Fmpeg%20API%20Documentation.md#op-video-pip) | 画中画 | ✓ |
+| [`/api/video/stack`](Fmpeg%20API%20Documentation.md#op-video-stack) | 多画面拼接 |  |
 
-```bash
-curl http://localhost:9527/api/tasks/649ec3c6-8033-4b6b-9d46-a0a2123dcdd2
-```
+**时间线剪辑**
 
-**响应示例：**
+| 接口 | 功能 | 串联 |
+| --- | --- | --- |
+| [`/api/edit/merge`](Fmpeg%20API%20Documentation.md#op-merge) | 视频拼接 |  |
+| [`/api/video/speed`](Fmpeg%20API%20Documentation.md#op-video-speed) | 视频变速 | ✓ |
+| [`/api/video/reverse`](Fmpeg%20API%20Documentation.md#op-video-reverse) | 视频倒放 | ✓ |
+| [`/api/video/loop`](Fmpeg%20API%20Documentation.md#op-video-loop) | 循环播放 | ✓ |
+| [`/api/video/fade`](Fmpeg%20API%20Documentation.md#op-video-fade) | 淡入淡出 | ✓ |
+| [`/api/video/cut`](Fmpeg%20API%20Documentation.md#op-video-cut) | 多段剪切 | ✓ |
+| [`/api/video/split`](Fmpeg%20API%20Documentation.md#op-video-split) | 分割视频 |  |
 
-```json
-{
-  "success": true,
-  "data": {
-    "id": "649ec3c6-8033-4b6b-9d46-a0a2123dcdd2",
-    "status": "completed",
-    "progress": 100,
-    "type": "compose",
-    "phase": "merging",
-    "createdAt": "2026-04-02T10:25:26.368Z",
-    "completedAt": "2026-04-02T10:26:05.422Z",
-    "elapsedSeconds": 39,
-    "currentVideoIndex": 5,
-    "totalVideos": 5,
-    "downloadUrl": ["/api/files/output.mp4"]
-  }
-}
-```
+**画面特效与压缩**
 
-**响应字段说明：**
+| 接口 | 功能 | 串联 |
+| --- | --- | --- |
+| [`/api/video/blur`](Fmpeg%20API%20Documentation.md#op-video-blur) | 区域模糊 / 马赛克 | ✓ |
+| [`/api/video/delogo`](Fmpeg%20API%20Documentation.md#op-video-delogo) | 去水印 | ✓ |
+| [`/api/video/color`](Fmpeg%20API%20Documentation.md#op-video-color) | 调色 / 滤镜 | ✓ |
+| [`/api/video/enhance`](Fmpeg%20API%20Documentation.md#op-video-enhance) | 画质增强 | ✓ |
+| [`/api/video/stabilize`](Fmpeg%20API%20Documentation.md#op-video-stabilize) | 视频防抖 | ✓ |
+| [`/api/video/mute`](Fmpeg%20API%20Documentation.md#op-video-mute) | 去除音轨 | ✓ |
+| [`/api/video/compress`](Fmpeg%20API%20Documentation.md#op-video-compress) | 视频压缩 | ✓ |
 
-| 字段 | 类型 | 说明 |
-| ---- | ---- | ---- |
-| `progress` | number | 进度 0-100 |
-| `phase` | string | **compose 任务专用**：`downloading`（下载视频中）/ `merging`（FFmpeg 合并中） |
-| `elapsedSeconds` | number | 已耗时（秒），任务完成后为总耗时 |
-| `currentVideoIndex` | number | 当前正在下载第几个视频（仅 compose 任务，下载阶段有效） |
-| `totalVideos` | number | 视频总数（仅 compose 任务） |
-| `downloadUrl` | string[] | 完成后的文件路径列表，拼上服务地址即可访问，如 `http://host:9527/api/files/xxx.mp4` |
+**字幕、配乐与生成视频**
 
-**compose 任务阶段说明：**
+| 接口 | 功能 | 串联 |
+| --- | --- | --- |
+| [`/api/video/subtitles`](Fmpeg%20API%20Documentation.md#op-video-subtitles) | 添加字幕 | ✓ |
+| [`/api/video/mix-audio`](Fmpeg%20API%20Documentation.md#op-video-mix-audio) | 添加 / 替换音频 | ✓ |
+| [`/api/video/from-audio`](Fmpeg%20API%20Documentation.md#op-video-from-audio) | 音频转视频 | ✓ |
+| [`/api/video/slideshow`](Fmpeg%20API%20Documentation.md#op-video-slideshow) | 图片幻灯片 |  |
 
-- `progress 0~55%`，`phase = downloading`：逐个下载视频，`currentVideoIndex` 实时更新
-- `progress 55~100%`，`phase = merging`：所有视频下载完毕，FFmpeg 执行合并
+**音频处理**
 
-**任务状态说明：**
+| 接口 | 功能 | 串联 |
+| --- | --- | --- |
+| [`/api/audio/convert`](Fmpeg%20API%20Documentation.md#op-audio-convert) | 音频格式转换 | ✓ |
+| [`/api/audio/normalize`](Fmpeg%20API%20Documentation.md#op-audio-normalize) | 响度标准化 | ✓ |
+| [`/api/video/normalize-audio`](Fmpeg%20API%20Documentation.md#op-video-normalize-audio) | 视频响度标准化 | ✓ |
+| [`/api/audio/denoise`](Fmpeg%20API%20Documentation.md#op-audio-denoise) | 音频降噪 | ✓ |
+| [`/api/audio/trim-silence`](Fmpeg%20API%20Documentation.md#op-audio-trim-silence) | 去除静音 | ✓ |
+| [`/api/audio/volume`](Fmpeg%20API%20Documentation.md#op-audio-volume) | 调整音量 | ✓ |
+| [`/api/audio/fade`](Fmpeg%20API%20Documentation.md#op-audio-fade) | 音频淡入淡出 | ✓ |
+| [`/api/audio/speed`](Fmpeg%20API%20Documentation.md#op-audio-speed) | 变速 / 变调 | ✓ |
+| [`/api/audio/trim`](Fmpeg%20API%20Documentation.md#op-audio-trim) | 音频裁剪 | ✓ |
+| [`/api/audio/reverse`](Fmpeg%20API%20Documentation.md#op-audio-reverse) | 音频倒放 | ✓ |
+| [`/api/audio/concat`](Fmpeg%20API%20Documentation.md#op-audio-concat) | 音频拼接 |  |
+| [`/api/audio/mix`](Fmpeg%20API%20Documentation.md#op-audio-mix) | 多轨混音 |  |
+| [`/api/audio/waveform`](Fmpeg%20API%20Documentation.md#op-audio-waveform) | 波形图 | ✓ |
+| [`/api/audio/spectrogram`](Fmpeg%20API%20Documentation.md#op-audio-spectrogram) | 频谱图 | ✓ |
 
-| 状态 | 说明 |
-|------|------|
-| `pending` | 等待处理 |
-| `processing` | 处理中 |
-| `completed` | 已完成，可通过 `downloadUrl` 下载 |
-| `failed` | 失败，查看 `error` 字段 |
+**分析、流媒体与图片**
 
----
+| 接口 | 功能 | 串联 |
+| --- | --- | --- |
+| [`/api/analyze/loudness`](Fmpeg%20API%20Documentation.md#op-analyze-loudness) | 响度分析 |  |
+| [`/api/analyze/scenes`](Fmpeg%20API%20Documentation.md#op-analyze-scenes) | 场景切换检测 |  |
+| [`/api/analyze/silence`](Fmpeg%20API%20Documentation.md#op-analyze-silence) | 静音检测 |  |
+| [`/api/analyze/black`](Fmpeg%20API%20Documentation.md#op-analyze-black) | 黑场检测 |  |
+| [`/api/analyze/peaks`](Fmpeg%20API%20Documentation.md#op-analyze-peaks) | 波形峰值 |  |
+| [`/api/video/hls`](Fmpeg%20API%20Documentation.md#op-video-hls) | HLS 多码率切片 |  |
+| [`/api/video/dash`](Fmpeg%20API%20Documentation.md#op-video-dash) | DASH 多码率切片 |  |
+| [`/api/image/convert`](Fmpeg%20API%20Documentation.md#op-image-convert) | 图片格式转换 | ✓ |
+<!-- END GENERATED: operation-index -->
 
-### 13. SSE 实时进度推送
-
-**`GET /api/tasks/:id/progress`**
-
-通过 Server-Sent Events 实时获取任务进度，适合前端实时展示进度条。
-
-**请求示例：**
-
-```bash
-curl -N http://localhost:9527/api/tasks/649ec3c6-8033-4b6b-9d46-a0a2123dcdd2/progress
-```
-
-**推送数据格式：**
-
-```
-data: {"id":"649ec3c6-...","status":"processing","progress":45,"type":"compose"}
-
-data: {"id":"649ec3c6-...","status":"completed","progress":100,"type":"compose","output":"..."}
-```
-
-**前端使用示例：**
-
-```javascript
-const es = new EventSource('/api/tasks/your-task-id/progress');
-es.onmessage = (event) => {
-  const task = JSON.parse(event.data);
-  console.log(`进度: ${task.progress}%`);
-  if (task.status === 'completed' || task.status === 'failed') {
-    es.close();
-  }
-};
-```
-
----
-
-### 14. 下载输出文件
-
-**`GET /api/files/:filename`**
-
-下载处理完成后的输出文件。文件路径从任务查询接口的 `downloadUrl` 字段获取。
-
-**请求示例：**
-
-```bash
-curl -O http://localhost:9527/api/files/output-abc123.mp4
-```
-
----
-
-## 完整使用流程示例
-
-以「在线合成视频 + 背景音乐」为例：
-
-```bash
-# 1. 提交合成任务
-RESPONSE=$(curl -s -X POST http://localhost:9527/api/compose \
-  -H "Content-Type: application/json" \
-  -d '{
-    "videos": [
-      "https://example.com/video1.mp4",
-      "https://example.com/video2.mp4"
-    ],
-    "music": "https://example.com/bgm.mp3"
-  }')
-
-echo $RESPONSE
-# {"success":true,"data":{"taskId":"abc-123","status":"pending"}}
-
-# 2. 轮询任务进度
-curl http://localhost:9527/api/tasks/abc-123
-# {"success":true,"data":{"status":"processing","progress":65,...}}
-
-# 3. 任务完成后下载
-curl -O http://localhost:9527/api/files/output-abc-123.mp4
-```
-
----
+平台接口：`GET /api/health`（健康检查）、`GET /api/tasks/:id`（任务详情）、`GET /api/tasks/:id/progress`（SSE 进度）、`POST /api/tasks/:id/cancel` / `DELETE /api/tasks/:id`（取消）、`POST /api/pipeline`（多步串联）、`GET /api/operations`、`GET /api/openapi.json`、`GET /api/files/*`（下载产物）。
 
 ## 环境变量
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `PORT` | 服务端口 | `9527` |
-| `MAX_CONCURRENT_TASKS` | 最大并发任务数，2G2核建议设为 `3` | `CPU核数-1` |
+| `REDIS_URL` | Redis 连接地址，Docker 部署用 `redis://redis:6379` | `redis://localhost:6379` |
+| `MAX_CONCURRENT_TASKS` | 最大并发任务数，2 核 2 G 建议设为 `3` | `CPU 核数 - 1` |
+| `FFMPEG_PATH` / `FFPROBE_PATH` | FFmpeg / FFprobe 可执行路径 | `ffmpeg` / `ffprobe` |
+| `MAX_UPLOAD_MB` | 单个上传文件的大小上限 | `500` |
+| `SAVE_OUTPUT_FILE` | 是否保留输出文件，`false` 时下载一次后删除 | `true` |
+| `OUTPUT_RETENTION_HOURS` | 本地产物保留多少小时，到期后台清理；`0` 表示永久保留 | `0` |
+| `TASK_TTL_SECONDS` | 任务记录在 Redis 中保留的秒数 | `86400` |
+| `MAX_QUEUE_LENGTH` | 排队任务数上限，超过后新提交返回 429；`0` 表示不限 | `0` |
+| `SYNC_TIMEOUT_SECONDS` | 同步接口（`/api/info`）的最长执行时间，排队等待的时间也算在内 | `60` |
+| `SYNC_MAX_CONCURRENCY` | 同步接口同时执行的请求数，超出的排队（最多排它的 8 倍），排满才返回 429；`0` 表示自动 | `0`（max(8, 2 × `MAX_CONCURRENT_TASKS`)） |
+| `PUBLIC_BASE_URL` | 服务对外地址（如 `https://media.example.com`），用于在任务详情和回调里给出完整下载地址 | 空（返回 `/api/files/…`） |
+| `API_KEYS` | 逗号分隔的 API Key，设置后除健康检查外都要鉴权 | 空（不鉴权） |
+| `PROTECT_FILES` | `/api/files` 下载是否也要 API Key | `false` |
+| `ALLOW_PRIVATE_URLS` | 是否允许输入链接和回调地址指向内网 / 回环地址 | `false` |
+| `WEBHOOK_SECRET` | 回调签名密钥，设置后回调带 `X-FFmpeg-Service-Signature` | 空 |
+| `WEBHOOK_RETRIES` | 回调失败后的重试次数 | `3` |
+| `WEBHOOK_TIMEOUT_SECONDS` | 单次回调请求的超时 | `10` |
+| `DOWNLOAD_CONCURRENCY` | 每个任务同时下载的链接数 | `3` |
+| `DOWNLOAD_RETRIES` | 每个链接下载失败后的重试次数 | `3` |
+| `DOWNLOAD_IDLE_TIMEOUT_SECONDS` | 下载时连续多少秒收不到数据就判定卡死并重试 | `30` |
+| `DOWNLOAD_MAX_MB` | 链接下载的单个文件大小上限 | `1024` |
+| `FONT_NAME` / `FONT_FILE` | 文字水印和烧录字幕用的字体名 / 字体文件，设置了 `FONT_FILE` 时优先用它；Docker 镜像里 `FONT_NAME` 为 `Noto Sans CJK SC` | 空 |
+| `S3_BUCKET` | 设置后产物上传到 S3 兼容对象存储 | 空（本地存储） |
+| `S3_ENDPOINT` / `S3_REGION` | 对象存储地址和区域（R2、MinIO、OSS 需要 endpoint） | 空 / `auto` |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | 访问密钥；不设时用 AWS 默认凭证链 | 空 |
+| `S3_FORCE_PATH_STYLE` | 路径风格访问（MinIO 需要，OSS 不能开） | `false` |
+| `S3_PREFIX` | 对象 key 前缀 | 空 |
+| `S3_PUBLIC_BASE_URL` | 公开访问地址（公开读的桶或 CDN）；不设时返回预签名链接 | 空 |
+| `S3_PRESIGN_EXPIRES_SECONDS` | 预签名链接有效期，最长 7 天 | `604800` |
+| `S3_KEEP_LOCAL_COPY` | 上传后是否保留本地副本 | `false` |
+
+各存储服务的配置示例见 [部署指南.md](部署指南.md)。
+
+## 开发：新增一个操作
+
+每个接口都是 `src/operations/<分组>/` 下的一个操作定义，HTTP 处理、排队、进度、存储、回调、取消和串联都由引擎统一完成：
+
+1. 新建文件，用 `defineOperation({...})` 写出接口地址、输入槽、参数 schema（`src/schemas/coerce.ts` 里有数字、时间、颜色等工具，每个字段用 `.meta({ description })` 写中文说明）和 `run(ctx, params)`。
+2. `run` 里用 `ctx.probe()` 读取输入信息，用 `ctx.ffmpeg(args, { duration })` 执行命令（自动带进度和取消），产物路径只能用 `ctx.outputPath(ext)` / `ctx.outputDir()` 生成。
+3. 用户提供的文字和文件不能直接拼进滤镜参数：写到 `ctx.workDir` 里，在滤镜中只写文件名（ffmpeg 以 workDir 为工作目录运行）。
+4. 加到分组的 `index.ts`，在 `test/unit/operations/<分组>/` 写测试（`test/helpers` 里有生成素材和执行操作的工具）。
+5. 运行 `pnpm docs:api` 更新接口文档。
